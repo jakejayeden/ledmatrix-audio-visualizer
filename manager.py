@@ -1,11 +1,6 @@
 """Real-time LEDMatrix audio visualizer using Raspberry Pi ALSA arecord."""
 from __future__ import annotations
-import math
-import re
-import shutil
-import subprocess
-import threading
-import time
+import math, re, shutil, subprocess, threading, time
 import numpy as np
 from PIL import Image, ImageDraw
 from src.plugin_system.base_plugin import BasePlugin
@@ -15,38 +10,38 @@ class AudioVisualizerPlugin(BasePlugin):
 
     def __init__(self, plugin_id, config, display_manager, cache_manager, plugin_manager):
         super().__init__(plugin_id, config, display_manager, cache_manager, plugin_manager)
-        self._lock = threading.Lock(); self._process = None; self._reader = None; self._stop_event = threading.Event()
-        self._audio_buffer = np.zeros(8192,dtype=np.float32); self._buffer_write=0; self._buffer_filled=0
+        self._lock=threading.Lock(); self._process=None; self._reader=None; self._stop_event=threading.Event()
+        self._audio_buffer=np.zeros(8192,dtype=np.float32); self._buffer_write=0; self._buffer_filled=0
         self._last_audio_active_at=float('-inf'); self._current_rms=0.0; self._audio_error=None
         self._levels=np.zeros(16,dtype=np.float32); self._peaks=np.zeros(16,dtype=np.float32)
+        self._needle_level=0.0
         self._load_config(config); self._resize_state(); self._start_audio()
 
     def _load_config(self,c):
         self.input_device=c.get('input_device'); self.vu_mode=str(c.get('vu_mode','spectrum')); self.sensitivity=float(c.get('sensitivity',8.0)); self.hold_while_audio_active=bool(c.get('hold_while_audio_active',False)); self.activity_threshold=float(c.get('activity_threshold',0.008)); self.release_delay_seconds=float(c.get('release_delay_seconds',2.5)); self.sample_rate=int(c.get('sample_rate',44100)); self.fft_size=int(c.get('fft_size',2048)); self.min_frequency=float(c.get('min_frequency',60)); self.max_frequency=float(c.get('max_frequency',16000)); self.bar_count=int(c.get('bar_count',16)); self.smoothing=float(c.get('smoothing',0.55)); self.peak_decay=float(c.get('peak_decay',0.8)); self.show_peaks=bool(c.get('show_peaks',True)); self.color_low=tuple(c.get('color_low',[0,255,80])); self.color_high=tuple(c.get('color_high',[255,30,0])); self.display_duration=float(c.get('display_duration',15))
 
     def _resize_state(self):
-        if len(self._levels)!=self.bar_count: self._levels=np.zeros(self.bar_count,dtype=np.float32); self._peaks=np.zeros(self.bar_count,dtype=np.float32)
+        if len(self._levels)!=self.bar_count:self._levels=np.zeros(self.bar_count,dtype=np.float32);self._peaks=np.zeros(self.bar_count,dtype=np.float32)
         wanted=max(self.fft_size*4,4096)
         with self._lock:
-            if len(self._audio_buffer)!=wanted: self._audio_buffer=np.zeros(wanted,dtype=np.float32); self._buffer_write=self._buffer_filled=0
+            if len(self._audio_buffer)!=wanted:self._audio_buffer=np.zeros(wanted,dtype=np.float32);self._buffer_write=self._buffer_filled=0
 
     def on_config_change(self,new_config):
-        old=(self.input_device,self.sample_rate,self.fft_size); super().on_config_change(new_config); self._load_config(self.config); self._resize_state()
-        if old!=(self.input_device,self.sample_rate,self.fft_size): self._stop_audio(); self._start_audio()
-
-    def get_display_duration(self): return self.display_duration
-    def has_live_priority(self): return self.hold_while_audio_active
+        old=(self.input_device,self.sample_rate,self.fft_size);super().on_config_change(new_config);self._load_config(self.config);self._resize_state()
+        if old!=(self.input_device,self.sample_rate,self.fft_size):self._stop_audio();self._start_audio()
+    def get_display_duration(self):return self.display_duration
+    def has_live_priority(self):return self.hold_while_audio_active
     def has_live_content(self):
-        if not self.hold_while_audio_active or not self._capture_running(): return False
-        with self._lock: last=self._last_audio_active_at
+        if not self.hold_while_audio_active or not self._capture_running():return False
+        with self._lock:last=self._last_audio_active_at
         return time.monotonic()-last<=self.release_delay_seconds
-    def get_live_modes(self): return ['audio-visualizer']
-    def _capture_running(self): return self._process is not None and self._process.poll() is None
+    def get_live_modes(self):return ['audio-visualizer']
+    def _capture_running(self):return self._process is not None and self._process.poll() is None
 
     def _device(self):
         value=self.input_device
         if value not in (None,'','default','auto'):
-            text=str(value).strip(); return 'plughw:'+text+',0' if text.isdigit() else text
+            text=str(value).strip();return 'plughw:'+text+',0' if text.isdigit() else text
         try:
             result=subprocess.run(['/usr/bin/arecord','-l'],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,timeout=3,check=False)
             match=re.search(r'^card\s+(\d+):.*?device\s+(\d+):',result.stdout,re.MULTILINE)
@@ -58,7 +53,7 @@ class AudioVisualizerPlugin(BasePlugin):
         if self._capture_running():return
         arecord=shutil.which('arecord')
         if not arecord:self._audio_error='arecord is unavailable';self.logger.error(self._audio_error);return
-        device=self._device(); command=[arecord,'-q','-D',device,'-f','S16_LE','-c','1','-r',str(self.sample_rate),'-t','raw']
+        device=self._device();command=[arecord,'-q','-D',device,'-f','S16_LE','-c','1','-r',str(self.sample_rate),'-t','raw']
         try:
             self._stop_event.clear();self._process=subprocess.Popen(command,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0);self._reader=threading.Thread(target=self._read_audio,daemon=True,name='audio-visualizer-capture');self._reader.start();self._audio_error=None;self.logger.info('Audio capture started using ALSA device %s',device)
         except Exception as exc:self._process=None;self._audio_error=str(exc);self.logger.error('Could not start ALSA audio capture: %s',exc,exc_info=True)
@@ -121,10 +116,8 @@ class AudioVisualizerPlugin(BasePlugin):
 
     @staticmethod
     def _color(a,b,t):t=max(0,min(1,float(t)));return tuple(int(x+(y-x)*t) for x,y in zip(a,b))
-    def _render(self):
-        width,height=int(self.display_manager.width),int(self.display_manager.height);image=Image.new('RGB',(width,height),(0,0,0));draw=ImageDraw.Draw(image)
-        if not self._capture_running():draw.rectangle((0,0,width-1,height-1),outline=(100,0,0));draw.line((0,0,width-1,height-1),fill=(255,0,0));draw.line((width-1,0,0,height-1),fill=(255,0,0));return image
-        # Analog needle mode is reserved in config; until its renderer lands, fall back safely to spectrum.
+
+    def _render_spectrum(self,image,draw,width,height):
         levels=self._spectrum();usable=max(1,height-1);slot=width/float(self.bar_count)
         for i,level in enumerate(levels):
             bar=max(0,min(usable,int(round(level*usable))));x0=int(round(i*slot));x1=max(x0,int(round((i+1)*slot))-1)
@@ -133,7 +126,45 @@ class AudioVisualizerPlugin(BasePlugin):
             if self.show_peaks:
                 self._peaks[i]=float(bar) if bar>=self._peaks[i] else max(0,self._peaks[i]-self.peak_decay);py=height-1-int(round(self._peaks[i]))
                 if 0<=py<height:draw.line((x0,py,x1,py),fill=self.color_high)
+
+    def _render_analog(self,image,draw,width,height):
+        # Classic single mechanical VU meter. The scale spans roughly -20 to +3 dB.
+        with self._lock:rms=self._current_rms
+        level=max(0.0,min(1.0,(20.0*math.log10(max(rms*self.sensitivity,1e-6))+20.0)/23.0))
+        # Fast attack, deliberately slower return gives the needle mechanical inertia.
+        rate=0.34 if level>self._needle_level else 0.075
+        self._needle_level += (level-self._needle_level)*rate
+        cx=width//2; cy=height+10; radius=max(18,min(width//2-3,height+7))
+        start=math.radians(205); end=math.radians(335)
+        def point(angle,r):return (int(round(cx+math.cos(angle)*r)),int(round(cy+math.sin(angle)*r)))
+        # Outer meter arc.
+        arc_box=(cx-radius,cy-radius,cx+radius,cy+radius)
+        draw.arc(arc_box,start=205,end=335,fill=(100,100,60),width=1)
+        labels=[(-20,0.00),(-10,0.25),(-7,0.39),(-5,0.50),(-3,0.62),(0,0.82),(3,1.00)]
+        for db,pos in labels:
+            a=start+(end-start)*pos
+            outer=point(a,radius);inner=point(a,radius-4)
+            color=(255,50,20) if db>=0 else ((255,190,20) if db>=-5 else (80,220,80))
+            draw.line((inner[0],inner[1],outer[0],outer[1]),fill=color)
+            text=str(db) if db<0 else ('0' if db==0 else '+3')
+            tx,ty=point(a,radius-9)
+            draw.text((tx-len(text)*3,ty-3),text,fill=color)
+        # Small VU legend near the top centre.
+        draw.text((max(0,cx-6),0),'VU',fill=(180,180,100))
+        angle=start+(end-start)*self._needle_level
+        tip=point(angle,radius-2)
+        pivot=(cx,cy)
+        draw.line((pivot[0],pivot[1],tip[0],tip[1]),fill=(255,40,20),width=2)
+        # Visible lower section of pivot despite centre sitting below the panel.
+        draw.ellipse((cx-2,height-3,cx+2,height+1),fill=(220,180,80))
+
+    def _render(self):
+        width,height=int(self.display_manager.width),int(self.display_manager.height);image=Image.new('RGB',(width,height),(0,0,0));draw=ImageDraw.Draw(image)
+        if not self._capture_running():draw.rectangle((0,0,width-1,height-1),outline=(100,0,0));draw.line((0,0,width-1,height-1),fill=(255,0,0));draw.line((width-1,0,0,height-1),fill=(255,0,0));return image
+        if self.vu_mode=='analog_needle':self._render_analog(image,draw,width,height)
+        else:self._render_spectrum(image,draw,width,height)
         return image
+
     def display(self,force_clear=False):
         try:self.display_manager.image=self._render();self.display_manager.draw=ImageDraw.Draw(self.display_manager.image);self.display_manager.update_display()
         except Exception as exc:self.logger.error('Audio visualizer render failed: %s',exc,exc_info=True)

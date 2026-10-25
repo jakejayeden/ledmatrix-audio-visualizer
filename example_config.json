@@ -1,0 +1,21 @@
+{
+  "audio-visualizer": {
+    "enabled": true,
+    "input_device": null,
+    "sensitivity": 1.0,
+    "hold_while_audio_active": false,
+    "activity_threshold": 0.025,
+    "release_delay_seconds": 2.5,
+    "sample_rate": 44100,
+    "fft_size": 2048,
+    "min_frequency": 60,
+    "max_frequency": 16000,
+    "bar_count": 32,
+    "smoothing": 0.65,
+    "peak_decay": 0.8,
+    "show_peaks": true,
+    "color_low": [0, 255, 80],
+    "color_high": [255, 30, 0],
+    "display_duration": 15
+  }
+}

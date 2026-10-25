@@ -37,9 +37,7 @@ class AudioVisualizerPlugin(BasePlugin):
         self.vu_mode = str(c.get('vu_mode', 'spectrum'))
         self.sensitivity = float(c.get('sensitivity', 4.0))
         self.debug_frequency = float(c.get('debug_frequency', 1000.0))
-        self.hold_while_audio_active = bool(c.get('hold_while_audio_active', False))
-        self.activity_threshold = float(c.get('activity_threshold', 0.008))
-        self.release_delay_seconds = float(c.get('release_delay_seconds', 2.5))
+        self.keep_active = bool(c.get('keep_active', False))
         self.sample_rate = int(c.get('sample_rate', 44100))
         self.fft_size = int(c.get('fft_size', 2048))
         self.min_frequency = float(c.get('min_frequency', 60))
@@ -105,14 +103,12 @@ class AudioVisualizerPlugin(BasePlugin):
         return self.display_duration
 
     def has_live_priority(self):
-        return self.hold_while_audio_active
+        """Use LEDMatrix live priority as a persistent user-controlled pin."""
+        return self.keep_active
 
     def has_live_content(self):
-        if not self.hold_while_audio_active or not self._capture_running():
-            return False
-        with self._lock:
-            last = self._last_audio_active_at
-        return time.monotonic() - last <= self.release_delay_seconds
+        """When pinned, the visualizer is always live so rotation stays paused."""
+        return self.keep_active
 
     def get_live_modes(self):
         return ['audio-visualizer']
@@ -180,11 +176,8 @@ class AudioVisualizerPlugin(BasePlugin):
 
     def _accept_samples(self, samples):
         rms = float(np.sqrt(np.mean(samples * samples)))
-        now = time.monotonic()
         with self._lock:
             self._current_rms = rms
-            if rms >= self.activity_threshold:
-                self._last_audio_active_at = now
             cap = len(self._audio_buffer)
             count = min(samples.size, cap)
             samples = samples[-count:]
@@ -465,5 +458,5 @@ class AudioVisualizerPlugin(BasePlugin):
         info = super().get_info()
         with self._lock:
             rms = self._current_rms
-        info.update({'audio_input_running': self._capture_running(), 'audio_error': self._audio_error, 'rms_level': round(rms,5), 'audio_active': self.has_live_content(), 'vu_mode': self.vu_mode, 'input_device': self.input_device or 'auto', 'sample_rate': self.sample_rate, 'fft_size': self.fft_size})
+        info.update({'audio_input_running': self._capture_running(), 'audio_error': self._audio_error, 'rms_level': round(rms,5), 'keep_active': self.keep_active, 'vu_mode': self.vu_mode, 'input_device': self.input_device or 'auto', 'sample_rate': self.sample_rate, 'fft_size': self.fft_size})
         return info

@@ -18,11 +18,11 @@ class AudioVisualizerPlugin(BasePlugin):
         self._lock = threading.Lock(); self._process = None; self._reader = None; self._stop_event = threading.Event()
         self._audio_buffer = np.zeros(8192,dtype=np.float32); self._buffer_write=0; self._buffer_filled=0
         self._last_audio_active_at=float('-inf'); self._current_rms=0.0; self._audio_error=None
-        self._levels=np.zeros(32,dtype=np.float32); self._peaks=np.zeros(32,dtype=np.float32)
+        self._levels=np.zeros(16,dtype=np.float32); self._peaks=np.zeros(16,dtype=np.float32)
         self._load_config(config); self._resize_state(); self._start_audio()
 
     def _load_config(self,c):
-        self.input_device=c.get('input_device'); self.sensitivity=float(c.get('sensitivity',4.0)); self.hold_while_audio_active=bool(c.get('hold_while_audio_active',False)); self.activity_threshold=float(c.get('activity_threshold',0.008)); self.release_delay_seconds=float(c.get('release_delay_seconds',2.5)); self.sample_rate=int(c.get('sample_rate',44100)); self.fft_size=int(c.get('fft_size',2048)); self.min_frequency=float(c.get('min_frequency',60)); self.max_frequency=float(c.get('max_frequency',16000)); self.bar_count=int(c.get('bar_count',32)); self.smoothing=float(c.get('smoothing',0.55)); self.peak_decay=float(c.get('peak_decay',0.8)); self.show_peaks=bool(c.get('show_peaks',True)); self.color_low=tuple(c.get('color_low',[0,255,80])); self.color_high=tuple(c.get('color_high',[255,30,0])); self.display_duration=float(c.get('display_duration',15))
+        self.input_device=c.get('input_device'); self.vu_mode=str(c.get('vu_mode','spectrum')); self.sensitivity=float(c.get('sensitivity',8.0)); self.hold_while_audio_active=bool(c.get('hold_while_audio_active',False)); self.activity_threshold=float(c.get('activity_threshold',0.008)); self.release_delay_seconds=float(c.get('release_delay_seconds',2.5)); self.sample_rate=int(c.get('sample_rate',44100)); self.fft_size=int(c.get('fft_size',2048)); self.min_frequency=float(c.get('min_frequency',60)); self.max_frequency=float(c.get('max_frequency',16000)); self.bar_count=int(c.get('bar_count',16)); self.smoothing=float(c.get('smoothing',0.55)); self.peak_decay=float(c.get('peak_decay',0.8)); self.show_peaks=bool(c.get('show_peaks',True)); self.color_low=tuple(c.get('color_low',[0,255,80])); self.color_high=tuple(c.get('color_high',[255,30,0])); self.display_duration=float(c.get('display_duration',15))
 
     def _resize_state(self):
         if len(self._levels)!=self.bar_count: self._levels=np.zeros(self.bar_count,dtype=np.float32); self._peaks=np.zeros(self.bar_count,dtype=np.float32)
@@ -117,7 +117,6 @@ class AudioVisualizerPlugin(BasePlugin):
         for i in range(self.bar_count):
             mask=(freqs>=edges[i])&(freqs<edges[i+1])
             if np.any(mask):values=spectrum[mask];raw[i]=float(np.sqrt(np.mean(values*values)))
-        # A wider quiet-signal range makes typical USB microphones much more visible.
         db=20*np.log10(np.maximum(raw,1e-8))+20*math.log10(max(.01,self.sensitivity));target=np.clip((db+80)/80,0,1).astype(np.float32);alpha=np.clip(self.smoothing,0,.95);self._levels=alpha*self._levels+(1-alpha)*target;return self._levels
 
     @staticmethod
@@ -125,6 +124,7 @@ class AudioVisualizerPlugin(BasePlugin):
     def _render(self):
         width,height=int(self.display_manager.width),int(self.display_manager.height);image=Image.new('RGB',(width,height),(0,0,0));draw=ImageDraw.Draw(image)
         if not self._capture_running():draw.rectangle((0,0,width-1,height-1),outline=(100,0,0));draw.line((0,0,width-1,height-1),fill=(255,0,0));draw.line((width-1,0,0,height-1),fill=(255,0,0));return image
+        # Analog needle mode is reserved in config; until its renderer lands, fall back safely to spectrum.
         levels=self._spectrum();usable=max(1,height-1);slot=width/float(self.bar_count)
         for i,level in enumerate(levels):
             bar=max(0,min(usable,int(round(level*usable))));x0=int(round(i*slot));x1=max(x0,int(round((i+1)*slot))-1)
@@ -141,4 +141,4 @@ class AudioVisualizerPlugin(BasePlugin):
     def get_info(self):
         info=super().get_info()
         with self._lock:rms=self._current_rms
-        info.update({'audio_input_running':self._capture_running(),'audio_error':self._audio_error,'rms_level':round(rms,5),'audio_active':self.has_live_content(),'input_device':self.input_device or 'auto','sample_rate':self.sample_rate,'fft_size':self.fft_size});return info
+        info.update({'audio_input_running':self._capture_running(),'audio_error':self._audio_error,'rms_level':round(rms,5),'audio_active':self.has_live_content(),'vu_mode':self.vu_mode,'input_device':self.input_device or 'auto','sample_rate':self.sample_rate,'fft_size':self.fft_size});return info

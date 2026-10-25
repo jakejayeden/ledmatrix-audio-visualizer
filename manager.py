@@ -162,7 +162,7 @@ class AudioVisualizerPlugin(BasePlugin):
             color=(255,50,20) if db>=0 else ((255,190,20) if db>=-5 else (80,220,80))
             draw.line((inner[0],inner[1],outer[0],outer[1]),fill=color)
             text=str(db) if db<0 else ('0' if db==0 else '+3');tx,ty=point(a,radius-9);draw.text((tx-len(text)*3,ty-3),text,fill=color)
-        draw.text((max(0,cx-6),0),'VU',fill=(180,180,100))
+        draw.text((max(0,cx-6),0),'VU',fill=(255,255,255))
         angle=start+(end-start)*self._needle_level;tip=point(angle,radius-2);pivot=(cx,cy)
         draw.line((pivot[0],pivot[1],tip[0],tip[1]),fill=(255,40,20),width=2)
         draw.ellipse((cx-2,height-3,cx+2,height+1),fill=(220,180,80))

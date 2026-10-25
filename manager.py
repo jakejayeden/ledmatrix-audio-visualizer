@@ -25,7 +25,8 @@ class AudioVisualizerPlugin(BasePlugin):
         self._peaks = np.zeros(16, dtype=np.float32)
         self._debug_levels = np.zeros(16, dtype=np.float32)
         self._needle_level = 0.0
-        self._vu_envelope = 0.0
+        self._vu_envelope = None
+        self._vu_last_update = None
         self._last_config_sync = 0.0
         self._load_config(config)
         self._resize_state()
@@ -34,7 +35,7 @@ class AudioVisualizerPlugin(BasePlugin):
     def _load_config(self, c):
         self.input_device = c.get('input_device')
         self.vu_mode = str(c.get('vu_mode', 'spectrum'))
-        self.sensitivity = float(c.get('sensitivity', 8.0))
+        self.sensitivity = float(c.get('sensitivity', 4.0))
         self.debug_frequency = float(c.get('debug_frequency', 1000.0))
         self.hold_while_audio_active = bool(c.get('hold_while_audio_active', False))
         self.activity_threshold = float(c.get('activity_threshold', 0.008))
@@ -55,7 +56,9 @@ class AudioVisualizerPlugin(BasePlugin):
         if len(self._levels) != self.bar_count:
             self._levels = np.zeros(self.bar_count, dtype=np.float32)
             self._peaks = np.zeros(self.bar_count, dtype=np.float32)
-        wanted = max(self.fft_size * 4, 4096)
+        # Keep at least half a second of audio so the analog meter can use a
+        # genuine 300 ms programme-level integration window.
+        wanted = max(self.fft_size * 4, int(self.sample_rate * 0.5), 4096)
         with self._lock:
             if len(self._audio_buffer) != wanted:
                 self._audio_buffer = np.zeros(wanted, dtype=np.float32)
@@ -70,7 +73,8 @@ class AudioVisualizerPlugin(BasePlugin):
         self._resize_state()
         if old_mode != self.vu_mode:
             self._needle_level = 0.0
-            self._vu_envelope = 0.0
+            self._vu_envelope = None
+            self._vu_last_update = None
             self._peaks.fill(0)
             self._debug_levels.fill(0)
             self.logger.info('VU mode changed from %s to %s', old_mode, self.vu_mode)
@@ -236,17 +240,28 @@ class AudioVisualizerPlugin(BasePlugin):
                 result[output+first:] = self._audio_buffer[:n-first]
             return result
 
+    def _recent_rms(self, seconds=0.300):
+        """RMS over the most recent audio window, used by the analog VU meter."""
+        wanted = max(1, int(self.sample_rate * seconds))
+        with self._lock:
+            n = min(self._buffer_filled, wanted)
+            if n <= 0:
+                return 0.0
+            start = (self._buffer_write - n) % len(self._audio_buffer)
+            end = start + n
+            if end <= len(self._audio_buffer):
+                samples = self._audio_buffer[start:end].copy()
+            else:
+                first = len(self._audio_buffer) - start
+                samples = np.concatenate((self._audio_buffer[start:].copy(), self._audio_buffer[:n-first].copy()))
+        if samples.size <= 0:
+            return 0.0
+        samples -= float(np.mean(samples))
+        return float(np.sqrt(np.mean(samples * samples)))
+
     @staticmethod
     def _frequency_compensation(frequencies):
-        """Measured visual gain curve from the 16-bar sensitivity calibration.
-
-        Calibration results (best moving bars) were approximately:
-        100 Hz: sensitivity 512-1024, 500 Hz: 512, 1 kHz: 512-1024,
-        3 kHz: 1024-2048, 6 kHz: 8192-16384. The debug test divides
-        sensitivity by the normal baseline of 8, so these become compensation
-        multipliers of about 90.5, 64, 90.5, 181 and 1448 respectively.
-        Interpolation is logarithmic in both frequency and gain.
-        """
+        """Measured visual gain curve from the 16-bar sensitivity calibration."""
         calibration_hz = np.array([100.0, 500.0, 1000.0, 3000.0, 6000.0], dtype=np.float64)
         calibration_gain = np.array([90.51, 64.0, 90.51, 181.02, 1448.15], dtype=np.float64)
         f = np.clip(np.asarray(frequencies, dtype=np.float64), calibration_hz[0], calibration_hz[-1])
@@ -269,16 +284,11 @@ class AudioVisualizerPlugin(BasePlugin):
             if np.any(mask):
                 values = spectrum[mask]
                 raw[i] = float(np.sqrt(np.mean(values * values)))
-
-        # Apply the measured frequency-response compensation before the same
-        # dB-to-height mapping used during calibration. Sensitivity 8 remains
-        # the neutral/default user setting; changing it scales the whole curve.
         compensation = self._frequency_compensation(centres)
-        user_gain = max(0.01, self.sensitivity) / 8.0
-        corrected = np.maximum(raw * compensation * user_gain, 1e-8)
+        user_gain = max(0.01, self.sensitivity) / 4.0
+        corrected = np.maximum(raw * compensation * user_gain * 0.5, 1e-8)
         db = 20.0 * np.log10(corrected)
         target = np.clip((db + 70.0) / 30.0, 0, 1).astype(np.float32)
-
         smoothing = float(np.clip(self.smoothing, 0, .95))
         attack = 0.82 - (0.12 * smoothing)
         release = 0.42 - (0.12 * smoothing)
@@ -353,15 +363,30 @@ class AudioVisualizerPlugin(BasePlugin):
                 draw.line((x0, height-1-y, x1, height-1-y), fill=self._color(self.color_low, self.color_high, y / max(1, usable-1)))
 
     def _render_analog(self, image, draw, width, height):
-        with self._lock:
-            rms = self._current_rms
+        # A real VU meter represents programme level over roughly 300 ms rather
+        # than the instantaneous 11 ms ALSA read chunks. This removes the
+        # artificial beat-by-beat oscillation while retaining natural motion.
+        rms = self._recent_rms(0.300)
         input_db = 20.0 * math.log10(max(rms, 1e-9))
-        gain_db = 20.0 * math.log10(max(0.01, self.sensitivity) / 8.0)
+        # The microphone was calibrated at sensitivity 8. Sensitivity 4 is now
+        # the UI default, so rebase the control around 4 while preserving the
+        # original measured 0 VU point (-44.5 dBFS at the microphone).
+        gain_db = 20.0 * math.log10(max(0.01, self.sensitivity) / 4.0)
         target_vu_db = input_db + 44.5 + gain_db
-        if self._vu_envelope <= 0.0:
+
+        now = time.monotonic()
+        if self._vu_envelope is None or self._vu_last_update is None:
             self._vu_envelope = target_vu_db
         else:
-            self._vu_envelope += (target_vu_db - self._vu_envelope) * 0.055
+            dt = max(0.001, min(0.25, now - self._vu_last_update))
+            # Mechanical-style ballistics: a little quicker on rising programme
+            # level, more relaxed on the return. The 300 ms RMS window already
+            # supplies the integration; this models the pointer inertia only.
+            tau = 0.12 if target_vu_db > self._vu_envelope else 0.22
+            alpha = 1.0 - math.exp(-dt / tau)
+            self._vu_envelope += (target_vu_db - self._vu_envelope) * alpha
+        self._vu_last_update = now
+
         vu_db = max(-20.0, min(3.0, self._vu_envelope))
         scale = [(-20.0, 0.00), (-10.0, 0.25), (-7.0, 0.39), (-5.0, 0.50), (-3.0, 0.62), (0.0, 0.82), (3.0, 1.00)]
         level = 0.0
@@ -374,7 +399,10 @@ class AudioVisualizerPlugin(BasePlugin):
                 break
         else:
             level = 1.0
-        self._needle_level += (level - self._needle_level) * 0.11
+        # The envelope above already has physical ballistics, so avoid another
+        # heavy low-pass stage here. A light pointer interpolation prevents
+        # single-pixel chatter without turning the motion into a metronome.
+        self._needle_level += (level - self._needle_level) * 0.45
         cx = width // 2
         cy = height + 10
         radius = max(18, min(width // 2 - 3, height + 7))
@@ -408,9 +436,9 @@ class AudioVisualizerPlugin(BasePlugin):
         image = Image.new('RGB', (width, height), (0, 0, 0))
         draw = ImageDraw.Draw(image)
         if not self._capture_running():
-            draw.rectangle((0, 0, width-1, height-1), outline=(100, 0, 0))
-            draw.line((0, 0, width-1, height-1), fill=(255, 0, 0))
-            draw.line((width-1, 0, 0, height-1), fill=(255, 0, 0))
+            draw.rectangle((0, 0,width-1,height-1), outline=(100,0,0))
+            draw.line((0,0,width-1,height-1), fill=(255,0,0))
+            draw.line((width-1,0,0,height-1), fill=(255,0,0))
             return image
         if self.vu_mode == 'analog_needle':
             self._render_analog(image, draw, width, height)
@@ -437,5 +465,5 @@ class AudioVisualizerPlugin(BasePlugin):
         info = super().get_info()
         with self._lock:
             rms = self._current_rms
-        info.update({'audio_input_running': self._capture_running(), 'audio_error': self._audio_error, 'rms_level': round(rms, 5), 'audio_active': self.has_live_content(), 'vu_mode': self.vu_mode, 'input_device': self.input_device or 'auto', 'sample_rate': self.sample_rate, 'fft_size': self.fft_size})
+        info.update({'audio_input_running': self._capture_running(), 'audio_error': self._audio_error, 'rms_level': round(rms,5), 'audio_active': self.has_live_content(), 'vu_mode': self.vu_mode, 'input_device': self.input_device or 'auto', 'sample_rate': self.sample_rate, 'fft_size': self.fft_size})
         return info

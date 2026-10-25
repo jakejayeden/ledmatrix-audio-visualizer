@@ -5,7 +5,7 @@
   "description": "USB microphone audio visualizer settings.",
   "properties": {
     "enabled": {"type":"boolean","default":true,"description":"Enable or disable this plugin"},
-    "vu_mode": {"type":"string","default":"spectrum","enum":["spectrum","analog_needle"],"enumNames":["Spectrum Bars","Analog Needle VU Meter"],"description":"Choose the visualizer style. Analog Needle is included as the next planned VU mode."},
+    "vu_mode": {"type":"string","default":"spectrum","enum":["spectrum","spectrum_falling","analog_needle"],"enumNames":["Spectrum Bars","Spectrum Falling","Analog Needle VU Meter"],"description":"Choose the visualizer style."},
     "input_device": {"type":["string","integer","null"],"default":null,"description":"ALSA capture device. Leave blank for automatic USB microphone detection."},
     "sensitivity": {"type":"number","default":8.0,"minimum":0.1,"maximum":50.0,"multipleOf":0.1,"description":"Visual microphone gain. 8.0 is the recommended default."},
     "hold_while_audio_active": {"type":"boolean","default":false,"description":"When enabled, temporarily prevent normal plugin rotation while audio is active"},

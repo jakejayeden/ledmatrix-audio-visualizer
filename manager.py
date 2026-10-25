@@ -14,11 +14,12 @@ class AudioVisualizerPlugin(BasePlugin):
         self._audio_buffer=np.zeros(8192,dtype=np.float32); self._buffer_write=0; self._buffer_filled=0
         self._last_audio_active_at=float('-inf'); self._current_rms=0.0; self._audio_error=None
         self._levels=np.zeros(16,dtype=np.float32); self._peaks=np.zeros(16,dtype=np.float32)
+        self._debug_levels=np.zeros(16,dtype=np.float32)
         self._needle_level=0.0; self._vu_envelope=0.0; self._last_config_sync=0.0
         self._load_config(config); self._resize_state(); self._start_audio()
 
     def _load_config(self,c):
-        self.input_device=c.get('input_device'); self.vu_mode=str(c.get('vu_mode','spectrum')); self.sensitivity=float(c.get('sensitivity',8.0)); self.hold_while_audio_active=bool(c.get('hold_while_audio_active',False)); self.activity_threshold=float(c.get('activity_threshold',0.008)); self.release_delay_seconds=float(c.get('release_delay_seconds',2.5)); self.sample_rate=int(c.get('sample_rate',44100)); self.fft_size=int(c.get('fft_size',2048)); self.min_frequency=float(c.get('min_frequency',60)); self.max_frequency=float(c.get('max_frequency',16000)); self.bar_count=int(c.get('bar_count',16)); self.smoothing=float(c.get('smoothing',0.55)); self.peak_decay=float(c.get('peak_decay',0.8)); self.show_peaks=bool(c.get('show_peaks',True)); self.color_low=tuple(c.get('color_low',[0,255,80])); self.color_high=tuple(c.get('color_high',[255,30,0])); self.display_duration=float(c.get('display_duration',15))
+        self.input_device=c.get('input_device'); self.vu_mode=str(c.get('vu_mode','spectrum')); self.sensitivity=float(c.get('sensitivity',8.0)); self.debug_frequency=float(c.get('debug_frequency',1000.0)); self.hold_while_audio_active=bool(c.get('hold_while_audio_active',False)); self.activity_threshold=float(c.get('activity_threshold',0.008)); self.release_delay_seconds=float(c.get('release_delay_seconds',2.5)); self.sample_rate=int(c.get('sample_rate',44100)); self.fft_size=int(c.get('fft_size',2048)); self.min_frequency=float(c.get('min_frequency',60)); self.max_frequency=float(c.get('max_frequency',16000)); self.bar_count=int(c.get('bar_count',16)); self.smoothing=float(c.get('smoothing',0.55)); self.peak_decay=float(c.get('peak_decay',0.8)); self.show_peaks=bool(c.get('show_peaks',True)); self.color_low=tuple(c.get('color_low',[0,255,80])); self.color_high=tuple(c.get('color_high',[255,30,0])); self.display_duration=float(c.get('display_duration',15))
 
     def _resize_state(self):
         if len(self._levels)!=self.bar_count:self._levels=np.zeros(self.bar_count,dtype=np.float32);self._peaks=np.zeros(self.bar_count,dtype=np.float32)
@@ -30,7 +31,7 @@ class AudioVisualizerPlugin(BasePlugin):
         old_audio=(self.input_device,self.sample_rate,self.fft_size); old_mode=self.vu_mode
         super().on_config_change(new_config); self.config=new_config; self._load_config(new_config); self._resize_state()
         if old_mode!=self.vu_mode:
-            self._needle_level=0.0; self._vu_envelope=0.0; self._peaks.fill(0)
+            self._needle_level=0.0; self._vu_envelope=0.0; self._peaks.fill(0); self._debug_levels.fill(0)
             self.logger.info('VU mode changed from %s to %s',old_mode,self.vu_mode)
         if old_audio!=(self.input_device,self.sample_rate,self.fft_size):self._stop_audio();self._start_audio()
 
@@ -151,6 +152,25 @@ class AudioVisualizerPlugin(BasePlugin):
         self._levels=np.clip(self._levels,0,1)
         return self._levels
 
+    def _debug_sensitivity_levels(self):
+        """Measure one frequency with 16 sensitivities: 1, 2, 4 ... 32768."""
+        samples=self._latest_samples();samples-=float(np.mean(samples))
+        spectrum=np.abs(np.fft.rfft(samples*np.hanning(len(samples))))/max(1.0,len(samples)/2)
+        freqs=np.fft.rfftfreq(len(samples),d=1.0/self.sample_rate)
+        target_hz=max(20.0,min(self.debug_frequency,self.sample_rate/2.0-1.0))
+        centre=int(np.argmin(np.abs(freqs-target_hz)))
+        lo=max(0,centre-1); hi=min(len(spectrum),centre+2)
+        values=spectrum[lo:hi]
+        raw=float(np.sqrt(np.mean(values*values))) if values.size else 0.0
+        sensitivities=np.power(2.0,np.arange(16,dtype=np.float32))
+        db=20.0*np.log10(max(raw,1e-8))+20.0*np.log10(sensitivities/8.0)
+        target=np.clip((db+70.0)/30.0,0,1).astype(np.float32)
+        smoothing=float(np.clip(self.smoothing,0,.95));attack=0.82-(0.12*smoothing);release=0.42-(0.12*smoothing)
+        response=np.where(target>=self._debug_levels,attack,release).astype(np.float32)
+        self._debug_levels += (target-self._debug_levels)*response
+        self._debug_levels=np.clip(self._debug_levels,0,1)
+        return self._debug_levels
+
     @staticmethod
     def _color(a,b,t):t=max(0,min(1,float(t)));return tuple(int(x+(y-x)*t) for x,y in zip(a,b))
 
@@ -168,6 +188,12 @@ class AudioVisualizerPlugin(BasePlugin):
             elif self.show_peaks:
                 self._peaks[i]=float(bar) if bar>=self._peaks[i] else max(0,self._peaks[i]-self.peak_decay);py=height-1-int(round(self._peaks[i]))
                 if 0<=py<height:draw.line((x0,py,x1,py),fill=self.color_high)
+
+    def _render_debug_sensitivity(self,image,draw,width,height):
+        levels=self._debug_sensitivity_levels();usable=max(1,height-1);slot=width/16.0
+        for i,level in enumerate(levels):
+            bar=max(0,min(usable,int(round(float(level)*usable))));x0=int(round(i*slot));x1=max(x0,int(round((i+1)*slot))-2)
+            for y in range(bar):draw.line((x0,height-1-y,x1,height-1-y),fill=self._color(self.color_low,self.color_high,y/max(1,usable-1)))
 
     def _render_analog(self,image,draw,width,height):
         with self._lock:rms=self._current_rms
@@ -194,6 +220,7 @@ class AudioVisualizerPlugin(BasePlugin):
         if not self._capture_running():draw.rectangle((0,0,width-1,height-1),outline=(100,0,0));draw.line((0,0,width-1,height-1),fill=(255,0,0));draw.line((width-1,0,0,height-1),fill=(255,0,0));return image
         if self.vu_mode=='analog_needle':self._render_analog(image,draw,width,height)
         elif self.vu_mode=='spectrum_falling':self._render_spectrum(image,draw,width,height,falling=True)
+        elif self.vu_mode=='debug_sensitivity':self._render_debug_sensitivity(image,draw,width,height)
         else:self._render_spectrum(image,draw,width,height)
         return image
 

@@ -14,8 +14,7 @@ class AudioVisualizerPlugin(BasePlugin):
         self._audio_buffer=np.zeros(8192,dtype=np.float32); self._buffer_write=0; self._buffer_filled=0
         self._last_audio_active_at=float('-inf'); self._current_rms=0.0; self._audio_error=None
         self._levels=np.zeros(16,dtype=np.float32); self._peaks=np.zeros(16,dtype=np.float32)
-        self._needle_level=0.0; self._vu_reference=0.0; self._vu_envelope=0.0; self._vu_history=[]
-        self._diag_started=time.monotonic(); self._diag_bucket_started=self._diag_started; self._diag_bucket=[]; self._diag_db=[]; self._diag_peak=[]; self._diag_reported=False
+        self._needle_level=0.0; self._vu_envelope=0.0
         self._load_config(config); self._resize_state(); self._start_audio()
 
     def _load_config(self,c):
@@ -31,7 +30,7 @@ class AudioVisualizerPlugin(BasePlugin):
         old_audio=(self.input_device,self.sample_rate,self.fft_size); old_mode=self.vu_mode
         super().on_config_change(new_config); self.config=new_config; self._load_config(new_config); self._resize_state()
         if old_mode!=self.vu_mode:
-            self._needle_level=0.0; self._vu_reference=0.0; self._vu_envelope=0.0; self._vu_history=[]; self._peaks.fill(0)
+            self._needle_level=0.0; self._vu_envelope=0.0; self._peaks.fill(0)
             self.logger.info('VU mode changed from %s to %s',old_mode,self.vu_mode)
         if old_audio!=(self.input_device,self.sample_rate,self.fft_size):self._stop_audio();self._start_audio()
     def get_display_duration(self):return self.display_duration
@@ -79,7 +78,7 @@ class AudioVisualizerPlugin(BasePlugin):
             self._audio_error=error or 'arecord exited with code {}'.format(process.returncode);self.logger.error('Audio capture stopped: %s',self._audio_error)
 
     def _accept_samples(self,samples):
-        rms=float(np.sqrt(np.mean(samples*samples)));peak=float(np.max(np.abs(samples)));now=time.monotonic()
+        rms=float(np.sqrt(np.mean(samples*samples)));now=time.monotonic()
         with self._lock:
             self._current_rms=rms
             if rms>=self.activity_threshold:self._last_audio_active_at=now
@@ -88,20 +87,6 @@ class AudioVisualizerPlugin(BasePlugin):
             else:
                 first=cap-self._buffer_write;self._audio_buffer[self._buffer_write:]=samples[:first];self._audio_buffer[:count-first]=samples[first:]
             self._buffer_write=(self._buffer_write+count)%cap;self._buffer_filled=min(cap,self._buffer_filled+count)
-        self._diagnostic_sample(rms,peak,now)
-
-    def _diagnostic_sample(self,rms,peak,now):
-        if self._diag_reported:return
-        self._diag_bucket.append((rms,peak))
-        if now-self._diag_bucket_started>=0.1:
-            bucket_rms=float(np.sqrt(np.mean([x[0]*x[0] for x in self._diag_bucket])))
-            bucket_peak=max(x[1] for x in self._diag_bucket)
-            self._diag_db.append(20.0*math.log10(max(bucket_rms,1e-9)));self._diag_peak.append(bucket_peak)
-            self._diag_bucket=[];self._diag_bucket_started=now
-        if now-self._diag_started>=15.0 and self._diag_db:
-            values=np.asarray(self._diag_db,dtype=np.float32);peaks=np.asarray(self._diag_peak,dtype=np.float32)
-            self.logger.warning('AUDIO CALIBRATION 15s: min=%.1f dBFS, p25=%.1f dBFS, median=%.1f dBFS, p75=%.1f dBFS, p95=%.1f dBFS, max=%.1f dBFS, peak95=%.4f, peakmax=%.4f, samples=%d',float(np.min(values)),float(np.percentile(values,25)),float(np.median(values)),float(np.percentile(values,75)),float(np.percentile(values,95)),float(np.max(values)),float(np.percentile(peaks,95)),float(np.max(peaks)),len(values))
-            self._diag_reported=True
 
     def _stop_audio(self):
         self._stop_event.set();process,self._process=self._process,None
@@ -153,25 +138,24 @@ class AudioVisualizerPlugin(BasePlugin):
 
     def _render_analog(self,image,draw,width,height):
         with self._lock:rms=self._current_rms
-        signal=max(rms*max(0.01,self.sensitivity),1e-7)
-        if self._vu_envelope<=0.0:self._vu_envelope=signal
-        self._vu_envelope += (signal-self._vu_envelope)*0.035
-        programme=max(self._vu_envelope,1e-7)
-        self._vu_history.append(programme)
-        if len(self._vu_history)>250:self._vu_history=self._vu_history[-250:]
-        if len(self._vu_history)>=25:
-            candidate=float(np.percentile(np.asarray(self._vu_history,dtype=np.float32),75))
-            if self._vu_reference<=0.0:self._vu_reference=max(candidate,1e-5)
-            else:self._vu_reference += (max(candidate,1e-5)-self._vu_reference)*0.01
-        elif self._vu_reference<=0.0:self._vu_reference=max(programme,1e-5)
-        relative_db=20.0*math.log10(programme/max(self._vu_reference,1e-7));vu_db=max(-20.0,min(3.0,relative_db))
+        # Fixed calibration from the measured microphone programme range. At the
+        # default sensitivity of 8, -44.5 dBFS (measured p95) is 0 VU. Sensitivity
+        # remains a useful gain control by shifting this fixed dBFS reading.
+        input_db=20.0*math.log10(max(rms,1e-9))
+        gain_db=20.0*math.log10(max(0.01,self.sensitivity)/8.0)
+        target_vu_db=input_db+44.5+gain_db
+        # Smooth in dB rather than continually moving the reference point. This
+        # removes the auto-ranging feedback/pumping while retaining natural motion.
+        if self._vu_envelope<=0.0:self._vu_envelope=target_vu_db
+        else:self._vu_envelope += (target_vu_db-self._vu_envelope)*0.055
+        vu_db=max(-20.0,min(3.0,self._vu_envelope))
         scale=[(-20.0,0.00),(-10.0,0.25),(-7.0,0.39),(-5.0,0.50),(-3.0,0.62),(0.0,0.82),(3.0,1.00)];level=0.0
         for i in range(len(scale)-1):
             db0,p0=scale[i];db1,p1=scale[i+1]
             if vu_db<=db1:
                 fraction=(vu_db-db0)/(db1-db0) if db1!=db0 else 0.0;level=p0+(p1-p0)*max(0.0,min(1.0,fraction));break
         else:level=1.0
-        self._needle_level += (level-self._needle_level)*0.09
+        self._needle_level += (level-self._needle_level)*0.11
         cx=width//2; cy=height+10; radius=max(18,min(width//2-3,height+7));start=math.radians(205);end=math.radians(335)
         def point(angle,r):return (int(round(cx+math.cos(angle)*r)),int(round(cy+math.sin(angle)*r)))
         arc_box=(cx-radius,cy-radius,cx+radius,cy+radius);draw.arc(arc_box,start=205,end=335,fill=(100,100,60),width=1)

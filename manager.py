@@ -14,7 +14,7 @@ class AudioVisualizerPlugin(BasePlugin):
         self._audio_buffer=np.zeros(8192,dtype=np.float32); self._buffer_write=0; self._buffer_filled=0
         self._last_audio_active_at=float('-inf'); self._current_rms=0.0; self._audio_error=None
         self._levels=np.zeros(16,dtype=np.float32); self._peaks=np.zeros(16,dtype=np.float32)
-        self._needle_level=0.0; self._vu_reference=0.0; self._vu_envelope=0.0
+        self._needle_level=0.0; self._vu_reference=0.0; self._vu_envelope=0.0; self._vu_history=[]
         self._load_config(config); self._resize_state(); self._start_audio()
 
     def _load_config(self,c):
@@ -30,7 +30,7 @@ class AudioVisualizerPlugin(BasePlugin):
         old_audio=(self.input_device,self.sample_rate,self.fft_size); old_mode=self.vu_mode
         super().on_config_change(new_config); self.config=new_config; self._load_config(new_config); self._resize_state()
         if old_mode!=self.vu_mode:
-            self._needle_level=0.0; self._vu_reference=0.0; self._vu_envelope=0.0; self._peaks.fill(0)
+            self._needle_level=0.0; self._vu_reference=0.0; self._vu_envelope=0.0; self._vu_history=[]; self._peaks.fill(0)
             self.logger.info('VU mode changed from %s to %s',old_mode,self.vu_mode)
         if old_audio!=(self.input_device,self.sample_rate,self.fft_size):self._stop_audio();self._start_audio()
     def get_display_duration(self):return self.display_duration
@@ -128,8 +128,6 @@ class AudioVisualizerPlugin(BasePlugin):
             if x1>x0:x1-=1
             for y in range(bar):draw.line((x0,height-1-y,x1,height-1-y),fill=self._color(self.color_low,self.color_high,y/max(1,usable-1)))
             if falling:
-                # One-pixel red peak cap: rises immediately with the bar, then falls
-                # at half the normal peak-decay speed until the live bar catches it.
                 if bar>=self._peaks[i]:self._peaks[i]=float(bar)
                 else:self._peaks[i]=max(float(bar),self._peaks[i]-max(0.05,self.peak_decay*0.5))
                 py=height-1-int(round(self._peaks[i]))
@@ -141,18 +139,22 @@ class AudioVisualizerPlugin(BasePlugin):
     def _render_analog(self,image,draw,width,height):
         with self._lock:rms=self._current_rms
         signal=max(rms*max(0.01,self.sensitivity),1e-7)
-        # First smooth the tiny ~12 ms microphone RMS chunks into a programme envelope.
-        # A VU meter is an averaging meter (roughly 300 ms ballistics), so feeding the
-        # raw chunks directly can make speech/music alternate between the scale stops.
+        # Smooth the microphone RMS first, then compare it with a stable rolling
+        # programme reference. The previous continuously chasing reference could
+        # create a feedback-like pumping cycle where the needle oscillated by itself.
         if self._vu_envelope<=0.0:self._vu_envelope=signal
-        envelope_rate=0.12 if signal>self._vu_envelope else 0.055
-        self._vu_envelope += (signal-self._vu_envelope)*envelope_rate
+        self._vu_envelope += (signal-self._vu_envelope)*0.035
         programme=max(self._vu_envelope,1e-7)
-        # The auto-reference follows upward moderately but releases extremely slowly.
-        # This keeps microphone gain differences manageable without chasing every beat.
-        if self._vu_reference<=0.0:self._vu_reference=max(programme,1e-5)
-        if programme>self._vu_reference:self._vu_reference += (programme-self._vu_reference)*0.08
-        else:self._vu_reference=max(1e-5,self._vu_reference*0.9998)
+        # Keep about five seconds of programme levels and use the upper quartile as
+        # the 0 VU reference. This reference moves only as the window evolves rather
+        # than reacting against the same sample that drives the needle.
+        self._vu_history.append(programme)
+        if len(self._vu_history)>250:self._vu_history=self._vu_history[-250:]
+        if len(self._vu_history)>=25:
+            candidate=float(np.percentile(np.asarray(self._vu_history,dtype=np.float32),75))
+            if self._vu_reference<=0.0:self._vu_reference=max(candidate,1e-5)
+            else:self._vu_reference += (max(candidate,1e-5)-self._vu_reference)*0.01
+        elif self._vu_reference<=0.0:self._vu_reference=max(programme,1e-5)
         relative_db=20.0*math.log10(programme/max(self._vu_reference,1e-7));vu_db=max(-20.0,min(3.0,relative_db))
         scale=[(-20.0,0.00),(-10.0,0.25),(-7.0,0.39),(-5.0,0.50),(-3.0,0.62),(0.0,0.82),(3.0,1.00)];level=0.0
         for i in range(len(scale)-1):
@@ -160,9 +162,7 @@ class AudioVisualizerPlugin(BasePlugin):
             if vu_db<=db1:
                 fraction=(vu_db-db0)/(db1-db0) if db1!=db0 else 0.0;level=p0+(p1-p0)*max(0.0,min(1.0,fraction));break
         else:level=1.0
-        # Symmetric, slower needle movement is closer to classic VU ballistics and
-        # avoids the previous fast-rise/slow-fall pumping between -20 and 0.
-        self._needle_level += (level-self._needle_level)*0.16
+        self._needle_level += (level-self._needle_level)*0.09
         cx=width//2; cy=height+10; radius=max(18,min(width//2-3,height+7));start=math.radians(205);end=math.radians(335)
         def point(angle,r):return (int(round(cx+math.cos(angle)*r)),int(round(cy+math.sin(angle)*r)))
         arc_box=(cx-radius,cy-radius,cx+radius,cy+radius);draw.arc(arc_box,start=205,end=335,fill=(100,100,60),width=1)

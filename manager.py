@@ -135,9 +135,13 @@ class AudioVisualizerPlugin(BasePlugin):
         for i in range(self.bar_count):
             mask=(freqs>=edges[i])&(freqs<edges[i+1])
             if np.any(mask):values=spectrum[mask];raw[i]=float(np.sqrt(np.mean(values*values)))
-        db=20*np.log10(np.maximum(raw,1e-8))+20*math.log10(max(.01,self.sensitivity));target=np.clip((db+80)/80,0,1).astype(np.float32)
+        # Map the microphone's useful programme range onto the full 32-pixel
+        # display. At sensitivity 8, -70 dB is the visual floor and -40 dB
+        # reaches full height. Sensitivity still shifts the range naturally.
+        db=20*np.log10(np.maximum(raw,1e-8))+20*math.log10(max(.01,self.sensitivity)/8.0)
+        target=np.clip((db+70.0)/30.0,0,1).astype(np.float32)
         # Punchier spectrum ballistics: snap up quickly on transients and fall
-        # fast enough to expose the gaps between beats.  Keep the configured
+        # fast enough to expose the gaps between beats. Keep the configured
         # smoothing as a small influence without letting it make the bars hang.
         smoothing=float(np.clip(self.smoothing,0,.95))
         attack=0.82-(0.12*smoothing)

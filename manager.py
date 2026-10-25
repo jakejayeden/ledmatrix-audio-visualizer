@@ -28,13 +28,9 @@ class AudioVisualizerPlugin(BasePlugin):
 
     def on_config_change(self,new_config):
         old_audio=(self.input_device,self.sample_rate,self.fft_size); old_mode=self.vu_mode
-        super().on_config_change(new_config)
-        # Use the callback payload directly. Some LEDMatrix versions notify the plugin
-        # before self.config has been refreshed, which otherwise leaves dropdown changes stale.
-        self.config=new_config
-        self._load_config(new_config); self._resize_state()
+        super().on_config_change(new_config); self.config=new_config; self._load_config(new_config); self._resize_state()
         if old_mode!=self.vu_mode:
-            self._needle_level=0.0; self._vu_reference=0.0
+            self._needle_level=0.0; self._vu_reference=0.0; self._peaks.fill(0)
             self.logger.info('VU mode changed from %s to %s',old_mode,self.vu_mode)
         if old_audio!=(self.input_device,self.sample_rate,self.fft_size):self._stop_audio();self._start_audio()
     def get_display_duration(self):return self.display_duration
@@ -125,13 +121,20 @@ class AudioVisualizerPlugin(BasePlugin):
     @staticmethod
     def _color(a,b,t):t=max(0,min(1,float(t)));return tuple(int(x+(y-x)*t) for x,y in zip(a,b))
 
-    def _render_spectrum(self,image,draw,width,height):
+    def _render_spectrum(self,image,draw,width,height,falling=False):
         levels=self._spectrum();usable=max(1,height-1);slot=width/float(self.bar_count)
         for i,level in enumerate(levels):
             bar=max(0,min(usable,int(round(level*usable))));x0=int(round(i*slot));x1=max(x0,int(round((i+1)*slot))-1)
             if x1>x0:x1-=1
             for y in range(bar):draw.line((x0,height-1-y,x1,height-1-y),fill=self._color(self.color_low,self.color_high,y/max(1,usable-1)))
-            if self.show_peaks:
+            if falling:
+                # One-pixel red peak cap: rises immediately with the bar, then falls
+                # independently until the bar catches it again.
+                if bar>=self._peaks[i]:self._peaks[i]=float(bar)
+                else:self._peaks[i]=max(float(bar),self._peaks[i]-max(0.1,self.peak_decay))
+                py=height-1-int(round(self._peaks[i]))
+                if 0<=py<height:draw.line((x0,py,x1,py),fill=(255,0,0))
+            elif self.show_peaks:
                 self._peaks[i]=float(bar) if bar>=self._peaks[i] else max(0,self._peaks[i]-self.peak_decay);py=height-1-int(round(self._peaks[i]))
                 if 0<=py<height:draw.line((x0,py,x1,py),fill=self.color_high)
 
@@ -161,6 +164,7 @@ class AudioVisualizerPlugin(BasePlugin):
         width,height=int(self.display_manager.width),int(self.display_manager.height);image=Image.new('RGB',(width,height),(0,0,0));draw=ImageDraw.Draw(image)
         if not self._capture_running():draw.rectangle((0,0,width-1,height-1),outline=(100,0,0));draw.line((0,0,width-1,height-1),fill=(255,0,0));draw.line((width-1,0,0,height-1),fill=(255,0,0));return image
         if self.vu_mode=='analog_needle':self._render_analog(image,draw,width,height)
+        elif self.vu_mode=='spectrum_falling':self._render_spectrum(image,draw,width,height,falling=True)
         else:self._render_spectrum(image,draw,width,height)
         return image
 

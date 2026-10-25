@@ -5,9 +5,10 @@
   "description": "USB microphone audio visualizer settings.",
   "properties": {
     "enabled": {"type":"boolean","default":true,"description":"Enable or disable this plugin"},
-    "vu_mode": {"type":"string","default":"spectrum","enum":["spectrum","spectrum_falling","analog_needle"],"enumNames":["Spectrum Bars","Spectrum Falling","Analog Needle VU Meter"],"description":"Choose the visualizer style."},
+    "vu_mode": {"type":"string","default":"spectrum","enum":["spectrum","spectrum_falling","analog_needle","debug_sensitivity"],"enumNames":["Spectrum Bars","Spectrum Falling","Analog Needle VU Meter","Debug: Sensitivity Calibration"],"description":"Choose the visualizer style."},
     "input_device": {"type":["string","integer","null"],"default":null,"description":"ALSA capture device. Leave blank for automatic USB microphone detection."},
     "sensitivity": {"type":"number","default":8.0,"minimum":0.1,"maximum":50.0,"multipleOf":0.1,"description":"Visual microphone gain. 8.0 is the recommended default."},
+    "debug_frequency": {"type":"number","default":1000,"minimum":20,"maximum":20000,"description":"Frequency sampled by Debug: Sensitivity Calibration. All 16 debug bars sample this same frequency."},
     "hold_while_audio_active": {"type":"boolean","default":false,"description":"When enabled, temporarily prevent normal plugin rotation while audio is active"},
     "activity_threshold": {"type":"number","default":0.008,"minimum":0.0001,"maximum":0.5,"multipleOf":0.0001,"description":"RMS audio level required to count as active for rotation takeover. Lower values detect quieter audio."},
     "release_delay_seconds": {"type":"number","default":2.5,"minimum":0.0,"maximum":30.0,"multipleOf":0.1,"description":"How long to keep control after audio falls below the activity threshold"},

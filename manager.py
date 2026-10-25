@@ -135,7 +135,17 @@ class AudioVisualizerPlugin(BasePlugin):
         for i in range(self.bar_count):
             mask=(freqs>=edges[i])&(freqs<edges[i+1])
             if np.any(mask):values=spectrum[mask];raw[i]=float(np.sqrt(np.mean(values*values)))
-        db=20*np.log10(np.maximum(raw,1e-8))+20*math.log10(max(.01,self.sensitivity));target=np.clip((db+80)/80,0,1).astype(np.float32);alpha=np.clip(self.smoothing,0,.95);self._levels=alpha*self._levels+(1-alpha)*target;return self._levels
+        db=20*np.log10(np.maximum(raw,1e-8))+20*math.log10(max(.01,self.sensitivity));target=np.clip((db+80)/80,0,1).astype(np.float32)
+        # Punchier spectrum ballistics: snap up quickly on transients and fall
+        # fast enough to expose the gaps between beats.  Keep the configured
+        # smoothing as a small influence without letting it make the bars hang.
+        smoothing=float(np.clip(self.smoothing,0,.95))
+        attack=0.82-(0.12*smoothing)
+        release=0.42-(0.12*smoothing)
+        response=np.where(target>=self._levels,attack,release).astype(np.float32)
+        self._levels += (target-self._levels)*response
+        self._levels=np.clip(self._levels,0,1)
+        return self._levels
 
     @staticmethod
     def _color(a,b,t):t=max(0,min(1,float(t)));return tuple(int(x+(y-x)*t) for x,y in zip(a,b))

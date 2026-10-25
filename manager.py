@@ -27,8 +27,16 @@ class AudioVisualizerPlugin(BasePlugin):
             if len(self._audio_buffer)!=wanted:self._audio_buffer=np.zeros(wanted,dtype=np.float32);self._buffer_write=self._buffer_filled=0
 
     def on_config_change(self,new_config):
-        old=(self.input_device,self.sample_rate,self.fft_size);super().on_config_change(new_config);self._load_config(self.config);self._resize_state()
-        if old!=(self.input_device,self.sample_rate,self.fft_size):self._stop_audio();self._start_audio()
+        old_audio=(self.input_device,self.sample_rate,self.fft_size); old_mode=self.vu_mode
+        super().on_config_change(new_config)
+        # Use the callback payload directly. Some LEDMatrix versions notify the plugin
+        # before self.config has been refreshed, which otherwise leaves dropdown changes stale.
+        self.config=new_config
+        self._load_config(new_config); self._resize_state()
+        if old_mode!=self.vu_mode:
+            self._needle_level=0.0; self._vu_reference=0.0
+            self.logger.info('VU mode changed from %s to %s',old_mode,self.vu_mode)
+        if old_audio!=(self.input_device,self.sample_rate,self.fft_size):self._stop_audio();self._start_audio()
     def get_display_duration(self):return self.display_duration
     def has_live_priority(self):return self.hold_while_audio_active
     def has_live_content(self):
@@ -128,44 +136,26 @@ class AudioVisualizerPlugin(BasePlugin):
                 if 0<=py<height:draw.line((x0,py,x1,py),fill=self.color_high)
 
     def _render_analog(self,image,draw,width,height):
-        # A microphone is not a calibrated line-level VU source, so fixed dBFS offsets
-        # can either pin or starve the needle. Track the recent programme peak instead.
         with self._lock:rms=self._current_rms
         signal=max(rms*max(0.01,self.sensitivity),1e-7)
-        # Fast reference rise, very slow release. This behaves like lightweight AGC:
-        # the loudest recent programme material becomes approximately 0 VU while the
-        # instantaneous RMS remains free to travel over the printed -20..+3 scale.
         if self._vu_reference<=0.0:self._vu_reference=max(signal,1e-5)
         if signal>self._vu_reference:self._vu_reference += (signal-self._vu_reference)*0.35
         else:self._vu_reference=max(1e-5,self._vu_reference*0.9995)
-        relative_db=20.0*math.log10(max(signal,1e-7)/max(self._vu_reference,1e-7))
-        # Put the tracked programme peak near 0 VU and retain 3 dB of headroom.
-        vu_db=max(-20.0,min(3.0,relative_db))
-        scale=[(-20.0,0.00),(-10.0,0.25),(-7.0,0.39),(-5.0,0.50),(-3.0,0.62),(0.0,0.82),(3.0,1.00)]
-        level=0.0
+        relative_db=20.0*math.log10(max(signal,1e-7)/max(self._vu_reference,1e-7));vu_db=max(-20.0,min(3.0,relative_db))
+        scale=[(-20.0,0.00),(-10.0,0.25),(-7.0,0.39),(-5.0,0.50),(-3.0,0.62),(0.0,0.82),(3.0,1.00)];level=0.0
         for i in range(len(scale)-1):
             db0,p0=scale[i];db1,p1=scale[i+1]
             if vu_db<=db1:
-                fraction=(vu_db-db0)/(db1-db0) if db1!=db0 else 0.0
-                level=p0+(p1-p0)*max(0.0,min(1.0,fraction));break
+                fraction=(vu_db-db0)/(db1-db0) if db1!=db0 else 0.0;level=p0+(p1-p0)*max(0.0,min(1.0,fraction));break
         else:level=1.0
-        rate=0.58 if level>self._needle_level else 0.14
-        self._needle_level += (level-self._needle_level)*rate
-        cx=width//2; cy=height+10; radius=max(18,min(width//2-3,height+7))
-        start=math.radians(205); end=math.radians(335)
+        rate=0.58 if level>self._needle_level else 0.14;self._needle_level += (level-self._needle_level)*rate
+        cx=width//2; cy=height+10; radius=max(18,min(width//2-3,height+7));start=math.radians(205);end=math.radians(335)
         def point(angle,r):return (int(round(cx+math.cos(angle)*r)),int(round(cy+math.sin(angle)*r)))
-        arc_box=(cx-radius,cy-radius,cx+radius,cy+radius)
-        draw.arc(arc_box,start=205,end=335,fill=(100,100,60),width=1)
+        arc_box=(cx-radius,cy-radius,cx+radius,cy+radius);draw.arc(arc_box,start=205,end=335,fill=(100,100,60),width=1)
         labels=[(-20,0.00),(-10,0.25),(-7,0.39),(-5,0.50),(-3,0.62),(0,0.82),(3,1.00)]
         for db,pos in labels:
-            a=start+(end-start)*pos;outer=point(a,radius);inner=point(a,radius-4)
-            color=(255,50,20) if db>=0 else ((255,190,20) if db>=-5 else (80,220,80))
-            draw.line((inner[0],inner[1],outer[0],outer[1]),fill=color)
-            text=str(db) if db<0 else ('0' if db==0 else '+3');tx,ty=point(a,radius-9);draw.text((tx-len(text)*3,ty-3),text,fill=color)
-        draw.text((max(0,cx-6),0),'VU',fill=(255,255,255))
-        angle=start+(end-start)*self._needle_level;tip=point(angle,radius-2);pivot=(cx,cy)
-        draw.line((pivot[0],pivot[1],tip[0],tip[1]),fill=(255,40,20),width=2)
-        draw.ellipse((cx-2,height-3,cx+2,height+1),fill=(220,180,80))
+            a=start+(end-start)*pos;outer=point(a,radius);inner=point(a,radius-4);color=(255,50,20) if db>=0 else ((255,190,20) if db>=-5 else (80,220,80));draw.line((inner[0],inner[1],outer[0],outer[1]),fill=color);text=str(db) if db<0 else ('0' if db==0 else '+3');tx,ty=point(a,radius-9);draw.text((tx-len(text)*3,ty-3),text,fill=color)
+        draw.text((max(0,cx-6),0),'VU',fill=(255,255,255));angle=start+(end-start)*self._needle_level;tip=point(angle,radius-2);pivot=(cx,cy);draw.line((pivot[0],pivot[1],tip[0],tip[1]),fill=(255,40,20),width=2);draw.ellipse((cx-2,height-3,cx+2,height+1),fill=(220,180,80))
 
     def _render(self):
         width,height=int(self.display_manager.width),int(self.display_manager.height);image=Image.new('RGB',(width,height),(0,0,0));draw=ImageDraw.Draw(image)

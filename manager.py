@@ -14,7 +14,7 @@ class AudioVisualizerPlugin(BasePlugin):
         self._audio_buffer=np.zeros(8192,dtype=np.float32); self._buffer_write=0; self._buffer_filled=0
         self._last_audio_active_at=float('-inf'); self._current_rms=0.0; self._audio_error=None
         self._levels=np.zeros(16,dtype=np.float32); self._peaks=np.zeros(16,dtype=np.float32)
-        self._needle_level=0.0
+        self._needle_level=0.0; self._vu_reference=0.0
         self._load_config(config); self._resize_state(); self._start_audio()
 
     def _load_config(self,c):
@@ -128,16 +128,19 @@ class AudioVisualizerPlugin(BasePlugin):
                 if 0<=py<height:draw.line((x0,py,x1,py),fill=self.color_high)
 
     def _render_analog(self,image,draw,width,height):
-        # Calibrate the microphone signal to the printed VU scale rather than expanding
-        # the normalized position. This preserves useful travel across the whole meter.
+        # A microphone is not a calibrated line-level VU source, so fixed dBFS offsets
+        # can either pin or starve the needle. Track the recent programme peak instead.
         with self._lock:rms=self._current_rms
-        dbfs=20.0*math.log10(max(rms,1e-7))
-        gain_db=20.0*math.log10(max(0.01,self.sensitivity))
-        # Sensitivity 8 adds about 18 dB. A further -6 dB calibration offset places
-        # normal programme audio around -10..0 VU instead of pinning it near zero.
-        vu_db=dbfs+gain_db-6.0
-        vu_db=max(-20.0,min(3.0,vu_db))
-        # Match the non-linear positions of the visible scale markings exactly.
+        signal=max(rms*max(0.01,self.sensitivity),1e-7)
+        # Fast reference rise, very slow release. This behaves like lightweight AGC:
+        # the loudest recent programme material becomes approximately 0 VU while the
+        # instantaneous RMS remains free to travel over the printed -20..+3 scale.
+        if self._vu_reference<=0.0:self._vu_reference=max(signal,1e-5)
+        if signal>self._vu_reference:self._vu_reference += (signal-self._vu_reference)*0.35
+        else:self._vu_reference=max(1e-5,self._vu_reference*0.9995)
+        relative_db=20.0*math.log10(max(signal,1e-7)/max(self._vu_reference,1e-7))
+        # Put the tracked programme peak near 0 VU and retain 3 dB of headroom.
+        vu_db=max(-20.0,min(3.0,relative_db))
         scale=[(-20.0,0.00),(-10.0,0.25),(-7.0,0.39),(-5.0,0.50),(-3.0,0.62),(0.0,0.82),(3.0,1.00)]
         level=0.0
         for i in range(len(scale)-1):
@@ -146,8 +149,7 @@ class AudioVisualizerPlugin(BasePlugin):
                 fraction=(vu_db-db0)/(db1-db0) if db1!=db0 else 0.0
                 level=p0+(p1-p0)*max(0.0,min(1.0,fraction));break
         else:level=1.0
-        # Quick attack with a smooth mechanical fall-back.
-        rate=0.62 if level>self._needle_level else 0.20
+        rate=0.58 if level>self._needle_level else 0.14
         self._needle_level += (level-self._needle_level)*rate
         cx=width//2; cy=height+10; radius=max(18,min(width//2-3,height+7))
         start=math.radians(205); end=math.radians(335)

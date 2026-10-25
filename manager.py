@@ -14,7 +14,7 @@ class AudioVisualizerPlugin(BasePlugin):
         self._audio_buffer=np.zeros(8192,dtype=np.float32); self._buffer_write=0; self._buffer_filled=0
         self._last_audio_active_at=float('-inf'); self._current_rms=0.0; self._audio_error=None
         self._levels=np.zeros(16,dtype=np.float32); self._peaks=np.zeros(16,dtype=np.float32)
-        self._needle_level=0.0; self._vu_envelope=0.0
+        self._needle_level=0.0; self._vu_envelope=0.0; self._last_config_sync=0.0
         self._load_config(config); self._resize_state(); self._start_audio()
 
     def _load_config(self,c):
@@ -33,6 +33,24 @@ class AudioVisualizerPlugin(BasePlugin):
             self._needle_level=0.0; self._vu_envelope=0.0; self._peaks.fill(0)
             self.logger.info('VU mode changed from %s to %s',old_mode,self.vu_mode)
         if old_audio!=(self.input_device,self.sample_rate,self.fft_size):self._stop_audio();self._start_audio()
+
+    def _sync_runtime_config(self):
+        """Fallback for LEDMatrix builds/save paths that miss on_config_change."""
+        now=time.monotonic()
+        if now-self._last_config_sync<0.5:return
+        self._last_config_sync=now
+        try:
+            manager=getattr(self,'plugin_manager',None)
+            config_manager=getattr(manager,'config_manager',None)
+            if config_manager is None:return
+            full=config_manager.get_config()
+            new_config=full.get(self.plugin_id,{}) if isinstance(full,dict) else {}
+            if isinstance(new_config,dict) and new_config and new_config!=self.config:
+                self.logger.info('Detected saved plugin config change; applying at runtime')
+                self.on_config_change(dict(new_config))
+        except Exception as exc:
+            self.logger.debug('Runtime config sync skipped: %s',exc)
+
     def get_display_duration(self):return self.display_duration
     def has_live_priority(self):return self.hold_while_audio_active
     def has_live_content(self):
@@ -99,6 +117,7 @@ class AudioVisualizerPlugin(BasePlugin):
         if reader and reader.is_alive():reader.join(timeout=1)
     def cleanup(self):self._stop_audio();super().cleanup()
     def update(self):
+        self._sync_runtime_config()
         if not self._capture_running():self._start_audio()
 
     def _latest_samples(self):
@@ -138,18 +157,10 @@ class AudioVisualizerPlugin(BasePlugin):
 
     def _render_analog(self,image,draw,width,height):
         with self._lock:rms=self._current_rms
-        # Fixed calibration from the measured microphone programme range. At the
-        # default sensitivity of 8, -44.5 dBFS (measured p95) is 0 VU. Sensitivity
-        # remains a useful gain control by shifting this fixed dBFS reading.
-        input_db=20.0*math.log10(max(rms,1e-9))
-        gain_db=20.0*math.log10(max(0.01,self.sensitivity)/8.0)
-        target_vu_db=input_db+44.5+gain_db
-        # Smooth in dB rather than continually moving the reference point. This
-        # removes the auto-ranging feedback/pumping while retaining natural motion.
+        input_db=20.0*math.log10(max(rms,1e-9));gain_db=20.0*math.log10(max(0.01,self.sensitivity)/8.0);target_vu_db=input_db+44.5+gain_db
         if self._vu_envelope<=0.0:self._vu_envelope=target_vu_db
         else:self._vu_envelope += (target_vu_db-self._vu_envelope)*0.055
-        vu_db=max(-20.0,min(3.0,self._vu_envelope))
-        scale=[(-20.0,0.00),(-10.0,0.25),(-7.0,0.39),(-5.0,0.50),(-3.0,0.62),(0.0,0.82),(3.0,1.00)];level=0.0
+        vu_db=max(-20.0,min(3.0,self._vu_envelope));scale=[(-20.0,0.00),(-10.0,0.25),(-7.0,0.39),(-5.0,0.50),(-3.0,0.62),(0.0,0.82),(3.0,1.00)];level=0.0
         for i in range(len(scale)-1):
             db0,p0=scale[i];db1,p1=scale[i+1]
             if vu_db<=db1:

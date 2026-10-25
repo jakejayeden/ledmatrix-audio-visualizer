@@ -4,123 +4,24 @@
   "title": "Audio Visualizer Configuration",
   "description": "USB microphone spectrum visualizer settings.",
   "properties": {
-    "enabled": {
-      "type": "boolean",
-      "default": true,
-      "description": "Enable or disable this plugin"
-    },
-    "input_device": {
-      "type": ["string", "integer", "null"],
-      "default": null,
-      "description": "Optional sounddevice input device name or index. Leave blank to use the default input device."
-    },
-    "sensitivity": {
-      "type": "number",
-      "default": 1.0,
-      "minimum": 0.1,
-      "maximum": 8.0,
-      "multipleOf": 0.1,
-      "description": "Visual gain applied to the spectrum bars"
-    },
-    "hold_while_audio_active": {
-      "type": "boolean",
-      "default": false,
-      "description": "When enabled, temporarily prevent normal plugin rotation while audio is active"
-    },
-    "activity_threshold": {
-      "type": "number",
-      "default": 0.025,
-      "minimum": 0.001,
-      "maximum": 0.5,
-      "multipleOf": 0.001,
-      "description": "RMS audio level required to count as active for rotation takeover"
-    },
-    "release_delay_seconds": {
-      "type": "number",
-      "default": 2.5,
-      "minimum": 0.0,
-      "maximum": 30.0,
-      "multipleOf": 0.1,
-      "description": "How long to keep control after audio falls below the activity threshold"
-    },
-    "sample_rate": {
-      "type": "integer",
-      "default": 44100,
-      "enum": [22050, 32000, 44100, 48000],
-      "description": "Microphone sample rate"
-    },
-    "fft_size": {
-      "type": "integer",
-      "default": 2048,
-      "enum": [512, 1024, 2048, 4096],
-      "description": "FFT window size; larger values improve low-frequency resolution but add latency"
-    },
-    "min_frequency": {
-      "type": "number",
-      "default": 60,
-      "minimum": 20,
-      "maximum": 1000,
-      "description": "Lowest displayed frequency in Hz"
-    },
-    "max_frequency": {
-      "type": "number",
-      "default": 16000,
-      "minimum": 1000,
-      "maximum": 22050,
-      "description": "Highest displayed frequency in Hz"
-    },
-    "bar_count": {
-      "type": "integer",
-      "default": 32,
-      "minimum": 8,
-      "maximum": 64,
-      "description": "Number of spectrum bars"
-    },
-    "smoothing": {
-      "type": "number",
-      "default": 0.65,
-      "minimum": 0.0,
-      "maximum": 0.95,
-      "multipleOf": 0.05,
-      "description": "Higher values make bar motion smoother"
-    },
-    "peak_decay": {
-      "type": "number",
-      "default": 0.8,
-      "minimum": 0.1,
-      "maximum": 3.0,
-      "multipleOf": 0.1,
-      "description": "Peak marker decay speed in pixels per frame"
-    },
-    "show_peaks": {
-      "type": "boolean",
-      "default": true,
-      "description": "Show falling peak markers above each bar"
-    },
-    "color_low": {
-      "type": "array",
-      "items": {"type": "integer", "minimum": 0, "maximum": 255},
-      "minItems": 3,
-      "maxItems": 3,
-      "default": [0, 255, 80],
-      "description": "RGB colour for low-level bars"
-    },
-    "color_high": {
-      "type": "array",
-      "items": {"type": "integer", "minimum": 0, "maximum": 255},
-      "minItems": 3,
-      "maxItems": 3,
-      "default": [255, 30, 0],
-      "description": "RGB colour for high-level bars and peak markers"
-    },
-    "display_duration": {
-      "type": "number",
-      "default": 15,
-      "minimum": 1,
-      "maximum": 300,
-      "description": "Normal rotation display duration in seconds"
-    }
+    "enabled": {"type":"boolean","default":true,"description":"Enable or disable this plugin"},
+    "input_device": {"type":["string","integer","null"],"default":null,"description":"ALSA capture device. Leave blank for automatic USB microphone detection."},
+    "sensitivity": {"type":"number","default":4.0,"minimum":0.1,"maximum":50.0,"multipleOf":0.1,"description":"Visual microphone gain. Increase this if the bars are too low; 4.0 is the recommended starting point."},
+    "hold_while_audio_active": {"type":"boolean","default":false,"description":"When enabled, temporarily prevent normal plugin rotation while audio is active"},
+    "activity_threshold": {"type":"number","default":0.008,"minimum":0.0001,"maximum":0.5,"multipleOf":0.0001,"description":"RMS audio level required to count as active for rotation takeover. Lower values detect quieter audio."},
+    "release_delay_seconds": {"type":"number","default":2.5,"minimum":0.0,"maximum":30.0,"multipleOf":0.1,"description":"How long to keep control after audio falls below the activity threshold"},
+    "sample_rate": {"type":"integer","default":44100,"enum":[22050,32000,44100,48000],"description":"Microphone sample rate"},
+    "fft_size": {"type":"integer","default":2048,"enum":[512,1024,2048,4096],"description":"FFT window size; larger values improve low-frequency resolution but add latency"},
+    "min_frequency": {"type":"number","default":60,"minimum":20,"maximum":1000,"description":"Lowest displayed frequency in Hz"},
+    "max_frequency": {"type":"number","default":16000,"minimum":1000,"maximum":22050,"description":"Highest displayed frequency in Hz"},
+    "bar_count": {"type":"integer","default":32,"minimum":8,"maximum":64,"description":"Number of spectrum bars"},
+    "smoothing": {"type":"number","default":0.55,"minimum":0.0,"maximum":0.95,"multipleOf":0.05,"description":"Higher values make bar motion smoother; lower values react faster"},
+    "peak_decay": {"type":"number","default":0.8,"minimum":0.1,"maximum":3.0,"multipleOf":0.1,"description":"Peak marker decay speed in pixels per frame"},
+    "show_peaks": {"type":"boolean","default":true,"description":"Show falling peak markers above each bar"},
+    "color_low": {"type":"array","items":{"type":"integer","minimum":0,"maximum":255},"minItems":3,"maxItems":3,"default":[0,255,80],"description":"RGB colour for low-level bars"},
+    "color_high": {"type":"array","items":{"type":"integer","minimum":0,"maximum":255},"minItems":3,"maxItems":3,"default":[255,30,0],"description":"RGB colour for high-level bars and peak markers"},
+    "display_duration": {"type":"number","default":15,"minimum":1,"maximum":300,"description":"Normal rotation display duration in seconds"}
   },
-  "required": ["enabled"],
-  "additionalProperties": false
+  "required":["enabled"],
+  "additionalProperties":false
 }

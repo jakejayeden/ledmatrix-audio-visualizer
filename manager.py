@@ -128,17 +128,26 @@ class AudioVisualizerPlugin(BasePlugin):
                 if 0<=py<height:draw.line((x0,py,x1,py),fill=self.color_high)
 
     def _render_analog(self,image,draw,width,height):
-        # Map a wide microphone range onto the full mechanical meter travel.
-        # With sensitivity 8, roughly -55 dBFS is the left stop and -12 dBFS reaches +3 VU.
+        # Calibrate the microphone signal to the printed VU scale rather than expanding
+        # the normalized position. This preserves useful travel across the whole meter.
         with self._lock:rms=self._current_rms
         dbfs=20.0*math.log10(max(rms,1e-7))
         gain_db=20.0*math.log10(max(0.01,self.sensitivity))
-        meter_db=dbfs+gain_db
-        level=max(0.0,min(1.0,(meter_db+55.0)/43.0))
-        # Gentle expansion in the quiet/mid range makes speech and music visibly expressive.
-        level=math.sqrt(level)
-        # Faster attack and a moderately damped return retain an analog feel without looking stuck.
-        rate=0.58 if level>self._needle_level else 0.16
+        # Sensitivity 8 adds about 18 dB. A further -6 dB calibration offset places
+        # normal programme audio around -10..0 VU instead of pinning it near zero.
+        vu_db=dbfs+gain_db-6.0
+        vu_db=max(-20.0,min(3.0,vu_db))
+        # Match the non-linear positions of the visible scale markings exactly.
+        scale=[(-20.0,0.00),(-10.0,0.25),(-7.0,0.39),(-5.0,0.50),(-3.0,0.62),(0.0,0.82),(3.0,1.00)]
+        level=0.0
+        for i in range(len(scale)-1):
+            db0,p0=scale[i];db1,p1=scale[i+1]
+            if vu_db<=db1:
+                fraction=(vu_db-db0)/(db1-db0) if db1!=db0 else 0.0
+                level=p0+(p1-p0)*max(0.0,min(1.0,fraction));break
+        else:level=1.0
+        # Quick attack with a smooth mechanical fall-back.
+        rate=0.62 if level>self._needle_level else 0.20
         self._needle_level += (level-self._needle_level)*rate
         cx=width//2; cy=height+10; radius=max(18,min(width//2-3,height+7))
         start=math.radians(205); end=math.radians(335)

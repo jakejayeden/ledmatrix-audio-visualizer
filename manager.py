@@ -128,34 +128,32 @@ class AudioVisualizerPlugin(BasePlugin):
                 if 0<=py<height:draw.line((x0,py,x1,py),fill=self.color_high)
 
     def _render_analog(self,image,draw,width,height):
-        # Classic single mechanical VU meter. The scale spans roughly -20 to +3 dB.
+        # Map a wide microphone range onto the full mechanical meter travel.
+        # With sensitivity 8, roughly -55 dBFS is the left stop and -12 dBFS reaches +3 VU.
         with self._lock:rms=self._current_rms
-        level=max(0.0,min(1.0,(20.0*math.log10(max(rms*self.sensitivity,1e-6))+20.0)/23.0))
-        # Fast attack, deliberately slower return gives the needle mechanical inertia.
-        rate=0.34 if level>self._needle_level else 0.075
+        dbfs=20.0*math.log10(max(rms,1e-7))
+        gain_db=20.0*math.log10(max(0.01,self.sensitivity))
+        meter_db=dbfs+gain_db
+        level=max(0.0,min(1.0,(meter_db+55.0)/43.0))
+        # Gentle expansion in the quiet/mid range makes speech and music visibly expressive.
+        level=math.sqrt(level)
+        # Faster attack and a moderately damped return retain an analog feel without looking stuck.
+        rate=0.58 if level>self._needle_level else 0.16
         self._needle_level += (level-self._needle_level)*rate
         cx=width//2; cy=height+10; radius=max(18,min(width//2-3,height+7))
         start=math.radians(205); end=math.radians(335)
         def point(angle,r):return (int(round(cx+math.cos(angle)*r)),int(round(cy+math.sin(angle)*r)))
-        # Outer meter arc.
         arc_box=(cx-radius,cy-radius,cx+radius,cy+radius)
         draw.arc(arc_box,start=205,end=335,fill=(100,100,60),width=1)
         labels=[(-20,0.00),(-10,0.25),(-7,0.39),(-5,0.50),(-3,0.62),(0,0.82),(3,1.00)]
         for db,pos in labels:
-            a=start+(end-start)*pos
-            outer=point(a,radius);inner=point(a,radius-4)
+            a=start+(end-start)*pos;outer=point(a,radius);inner=point(a,radius-4)
             color=(255,50,20) if db>=0 else ((255,190,20) if db>=-5 else (80,220,80))
             draw.line((inner[0],inner[1],outer[0],outer[1]),fill=color)
-            text=str(db) if db<0 else ('0' if db==0 else '+3')
-            tx,ty=point(a,radius-9)
-            draw.text((tx-len(text)*3,ty-3),text,fill=color)
-        # Small VU legend near the top centre.
+            text=str(db) if db<0 else ('0' if db==0 else '+3');tx,ty=point(a,radius-9);draw.text((tx-len(text)*3,ty-3),text,fill=color)
         draw.text((max(0,cx-6),0),'VU',fill=(180,180,100))
-        angle=start+(end-start)*self._needle_level
-        tip=point(angle,radius-2)
-        pivot=(cx,cy)
+        angle=start+(end-start)*self._needle_level;tip=point(angle,radius-2);pivot=(cx,cy)
         draw.line((pivot[0],pivot[1],tip[0],tip[1]),fill=(255,40,20),width=2)
-        # Visible lower section of pivot despite centre sitting below the panel.
         draw.ellipse((cx-2,height-3,cx+2,height+1),fill=(220,180,80))
 
     def _render(self):

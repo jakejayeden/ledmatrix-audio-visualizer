@@ -15,238 +15,130 @@ class AudioVisualizerPlugin(BasePlugin):
 
     def __init__(self, plugin_id, config, display_manager, cache_manager, plugin_manager):
         super().__init__(plugin_id, config, display_manager, cache_manager, plugin_manager)
-        self._lock = threading.Lock()
-        self._process = None
-        self._reader = None
-        self._stop_event = threading.Event()
-        self._audio_buffer = np.zeros(8192, dtype=np.float32)
-        self._buffer_write = 0
-        self._buffer_filled = 0
-        self._last_audio_active_at = float('-inf')
-        self._current_rms = 0.0
-        self._audio_error = None
-        self._levels = np.zeros(32, dtype=np.float32)
-        self._peaks = np.zeros(32, dtype=np.float32)
-        self._load_config(config)
-        self._resize_state()
-        self._start_audio()
+        self._lock = threading.Lock(); self._process = None; self._reader = None; self._stop_event = threading.Event()
+        self._audio_buffer = np.zeros(8192,dtype=np.float32); self._buffer_write=0; self._buffer_filled=0
+        self._last_audio_active_at=float('-inf'); self._current_rms=0.0; self._audio_error=None
+        self._levels=np.zeros(32,dtype=np.float32); self._peaks=np.zeros(32,dtype=np.float32)
+        self._load_config(config); self._resize_state(); self._start_audio()
 
-    def _load_config(self, c):
-        self.input_device = c.get('input_device')
-        self.sensitivity = float(c.get('sensitivity', 1.0))
-        self.hold_while_audio_active = bool(c.get('hold_while_audio_active', False))
-        self.activity_threshold = float(c.get('activity_threshold', 0.025))
-        self.release_delay_seconds = float(c.get('release_delay_seconds', 2.5))
-        self.sample_rate = int(c.get('sample_rate', 44100))
-        self.fft_size = int(c.get('fft_size', 2048))
-        self.min_frequency = float(c.get('min_frequency', 60))
-        self.max_frequency = float(c.get('max_frequency', 16000))
-        self.bar_count = int(c.get('bar_count', 32))
-        self.smoothing = float(c.get('smoothing', 0.65))
-        self.peak_decay = float(c.get('peak_decay', 0.8))
-        self.show_peaks = bool(c.get('show_peaks', True))
-        self.color_low = tuple(c.get('color_low', [0,255,80]))
-        self.color_high = tuple(c.get('color_high', [255,30,0]))
-        self.display_duration = float(c.get('display_duration', 15))
+    def _load_config(self,c):
+        self.input_device=c.get('input_device'); self.sensitivity=float(c.get('sensitivity',4.0)); self.hold_while_audio_active=bool(c.get('hold_while_audio_active',False)); self.activity_threshold=float(c.get('activity_threshold',0.008)); self.release_delay_seconds=float(c.get('release_delay_seconds',2.5)); self.sample_rate=int(c.get('sample_rate',44100)); self.fft_size=int(c.get('fft_size',2048)); self.min_frequency=float(c.get('min_frequency',60)); self.max_frequency=float(c.get('max_frequency',16000)); self.bar_count=int(c.get('bar_count',32)); self.smoothing=float(c.get('smoothing',0.55)); self.peak_decay=float(c.get('peak_decay',0.8)); self.show_peaks=bool(c.get('show_peaks',True)); self.color_low=tuple(c.get('color_low',[0,255,80])); self.color_high=tuple(c.get('color_high',[255,30,0])); self.display_duration=float(c.get('display_duration',15))
 
     def _resize_state(self):
-        if len(self._levels) != self.bar_count:
-            self._levels = np.zeros(self.bar_count, dtype=np.float32)
-            self._peaks = np.zeros(self.bar_count, dtype=np.float32)
-        wanted = max(self.fft_size * 4, 4096)
+        if len(self._levels)!=self.bar_count: self._levels=np.zeros(self.bar_count,dtype=np.float32); self._peaks=np.zeros(self.bar_count,dtype=np.float32)
+        wanted=max(self.fft_size*4,4096)
         with self._lock:
-            if len(self._audio_buffer) != wanted:
-                self._audio_buffer = np.zeros(wanted, dtype=np.float32)
-                self._buffer_write = self._buffer_filled = 0
+            if len(self._audio_buffer)!=wanted: self._audio_buffer=np.zeros(wanted,dtype=np.float32); self._buffer_write=self._buffer_filled=0
 
-    def on_config_change(self, new_config):
-        old = (self.input_device, self.sample_rate, self.fft_size)
-        super().on_config_change(new_config)
-        self._load_config(self.config)
-        self._resize_state()
-        if old != (self.input_device, self.sample_rate, self.fft_size):
-            self._stop_audio()
-            self._start_audio()
+    def on_config_change(self,new_config):
+        old=(self.input_device,self.sample_rate,self.fft_size); super().on_config_change(new_config); self._load_config(self.config); self._resize_state()
+        if old!=(self.input_device,self.sample_rate,self.fft_size): self._stop_audio(); self._start_audio()
 
     def get_display_duration(self): return self.display_duration
     def has_live_priority(self): return self.hold_while_audio_active
     def has_live_content(self):
         if not self.hold_while_audio_active or not self._capture_running(): return False
-        with self._lock: last = self._last_audio_active_at
-        return time.monotonic() - last <= self.release_delay_seconds
+        with self._lock: last=self._last_audio_active_at
+        return time.monotonic()-last<=self.release_delay_seconds
     def get_live_modes(self): return ['audio-visualizer']
-
-    def _capture_running(self):
-        return self._process is not None and self._process.poll() is None
+    def _capture_running(self): return self._process is not None and self._process.poll() is None
 
     def _device(self):
-        value = self.input_device
-        if value not in (None, '', 'default', 'auto'):
-            text = str(value).strip()
-            if text.isdigit(): return 'plughw:' + text + ',0'
-            return text
+        value=self.input_device
+        if value not in (None,'','default','auto'):
+            text=str(value).strip(); return 'plughw:'+text+',0' if text.isdigit() else text
         try:
-            result = subprocess.run(['/usr/bin/arecord','-l'], stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, text=True, timeout=3, check=False)
-            match = re.search(r'^card\s+(\d+):.*?device\s+(\d+):', result.stdout, re.MULTILINE)
-            if match: return 'plughw:{},{}'.format(match.group(1), match.group(2))
-        except Exception as exc:
-            self.logger.warning('Could not auto-detect microphone: %s', exc)
+            result=subprocess.run(['/usr/bin/arecord','-l'],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,timeout=3,check=False)
+            match=re.search(r'^card\s+(\d+):.*?device\s+(\d+):',result.stdout,re.MULTILINE)
+            if match:return 'plughw:{},{}'.format(match.group(1),match.group(2))
+        except Exception as exc:self.logger.warning('Could not auto-detect microphone: %s',exc)
         return 'default'
 
     def _start_audio(self):
-        if self._capture_running(): return
-        arecord = shutil.which('arecord')
-        if not arecord:
-            self._audio_error = 'arecord is unavailable'
-            self.logger.error(self._audio_error)
-            return
-        device = self._device()
-        command = [arecord, '-q', '-D', device, '-f', 'S16_LE', '-c', '1', '-r', str(self.sample_rate), '-t', 'raw']
+        if self._capture_running():return
+        arecord=shutil.which('arecord')
+        if not arecord:self._audio_error='arecord is unavailable';self.logger.error(self._audio_error);return
+        device=self._device(); command=[arecord,'-q','-D',device,'-f','S16_LE','-c','1','-r',str(self.sample_rate),'-t','raw']
         try:
-            self._stop_event.clear()
-            self._process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
-            self._reader = threading.Thread(target=self._read_audio, daemon=True, name='audio-visualizer-capture')
-            self._reader.start()
-            self._audio_error = None
-            self.logger.info('Audio capture started using ALSA device %s', device)
-        except Exception as exc:
-            self._process = None
-            self._audio_error = str(exc)
-            self.logger.error('Could not start ALSA audio capture: %s', exc, exc_info=True)
+            self._stop_event.clear();self._process=subprocess.Popen(command,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0);self._reader=threading.Thread(target=self._read_audio,daemon=True,name='audio-visualizer-capture');self._reader.start();self._audio_error=None;self.logger.info('Audio capture started using ALSA device %s',device)
+        except Exception as exc:self._process=None;self._audio_error=str(exc);self.logger.error('Could not start ALSA audio capture: %s',exc,exc_info=True)
 
     def _read_audio(self):
-        process = self._process
+        process=self._process
         try:
             while not self._stop_event.is_set() and process and process.poll() is None:
-                data = process.stdout.read(1024) if process.stdout else b''
-                if not data: break
-                samples = np.frombuffer(data, dtype='<i2').astype(np.float32) / 32768.0
-                if samples.size: self._accept_samples(samples)
+                data=process.stdout.read(1024) if process.stdout else b''
+                if not data:break
+                samples=np.frombuffer(data,dtype='<i2').astype(np.float32)/32768.0
+                if samples.size:self._accept_samples(samples)
         except Exception as exc:
-            if not self._stop_event.is_set():
-                self._audio_error = str(exc)
-                self.logger.error('Audio reader failed: %s', exc, exc_info=True)
+            if not self._stop_event.is_set():self._audio_error=str(exc);self.logger.error('Audio reader failed: %s',exc,exc_info=True)
         if process and process.poll() is not None and not self._stop_event.is_set():
-            try: error = process.stderr.read().decode(errors='replace').strip() if process.stderr else ''
-            except Exception: error = ''
-            self._audio_error = error or 'arecord exited with code {}'.format(process.returncode)
-            self.logger.error('Audio capture stopped: %s', self._audio_error)
+            try:error=process.stderr.read().decode(errors='replace').strip() if process.stderr else ''
+            except Exception:error=''
+            self._audio_error=error or 'arecord exited with code {}'.format(process.returncode);self.logger.error('Audio capture stopped: %s',self._audio_error)
 
-    def _accept_samples(self, samples):
-        rms = float(np.sqrt(np.mean(samples * samples)))
-        now = time.monotonic()
+    def _accept_samples(self,samples):
+        rms=float(np.sqrt(np.mean(samples*samples)));now=time.monotonic()
         with self._lock:
-            self._current_rms = rms
-            if rms >= self.activity_threshold: self._last_audio_active_at = now
-            capacity = len(self._audio_buffer)
-            count = min(samples.size, capacity)
-            samples = samples[-count:]
-            end = self._buffer_write + count
-            if end <= capacity: self._audio_buffer[self._buffer_write:end] = samples
+            self._current_rms=rms
+            if rms>=self.activity_threshold:self._last_audio_active_at=now
+            cap=len(self._audio_buffer);count=min(samples.size,cap);samples=samples[-count:];end=self._buffer_write+count
+            if end<=cap:self._audio_buffer[self._buffer_write:end]=samples
             else:
-                first = capacity - self._buffer_write
-                self._audio_buffer[self._buffer_write:] = samples[:first]
-                self._audio_buffer[:count-first] = samples[first:]
-            self._buffer_write = (self._buffer_write + count) % capacity
-            self._buffer_filled = min(capacity, self._buffer_filled + count)
+                first=cap-self._buffer_write;self._audio_buffer[self._buffer_write:]=samples[:first];self._audio_buffer[:count-first]=samples[first:]
+            self._buffer_write=(self._buffer_write+count)%cap;self._buffer_filled=min(cap,self._buffer_filled+count)
 
     def _stop_audio(self):
-        self._stop_event.set()
-        process, self._process = self._process, None
+        self._stop_event.set();process,self._process=self._process,None
         if process:
-            try:
-                process.terminate()
-                process.wait(timeout=1)
+            try:process.terminate();process.wait(timeout=1)
             except Exception:
-                try: process.kill()
-                except Exception: pass
-        reader, self._reader = self._reader, None
-        if reader and reader.is_alive(): reader.join(timeout=1)
-
-    def cleanup(self):
-        self._stop_audio()
-        super().cleanup()
-
+                try:process.kill()
+                except Exception:pass
+        reader,self._reader=self._reader,None
+        if reader and reader.is_alive():reader.join(timeout=1)
+    def cleanup(self):self._stop_audio();super().cleanup()
     def update(self):
-        if not self._capture_running(): self._start_audio()
+        if not self._capture_running():self._start_audio()
 
     def _latest_samples(self):
         with self._lock:
-            n = min(self._buffer_filled, self.fft_size)
-            result = np.zeros(self.fft_size, dtype=np.float32)
-            if n <= 0: return result
-            output = self.fft_size - n
-            start = (self._buffer_write - n) % len(self._audio_buffer)
-            end = start + n
-            if end <= len(self._audio_buffer): result[output:] = self._audio_buffer[start:end]
+            n=min(self._buffer_filled,self.fft_size);result=np.zeros(self.fft_size,dtype=np.float32)
+            if n<=0:return result
+            output=self.fft_size-n;start=(self._buffer_write-n)%len(self._audio_buffer);end=start+n
+            if end<=len(self._audio_buffer):result[output:]=self._audio_buffer[start:end]
             else:
-                first = len(self._audio_buffer) - start
-                result[output:output+first] = self._audio_buffer[start:]
-                result[output+first:] = self._audio_buffer[:n-first]
+                first=len(self._audio_buffer)-start;result[output:output+first]=self._audio_buffer[start:];result[output+first:]=self._audio_buffer[:n-first]
             return result
 
     def _spectrum(self):
-        samples = self._latest_samples()
-        samples -= float(np.mean(samples))
-        spectrum = np.abs(np.fft.rfft(samples * np.hanning(len(samples)))) / max(1.0, len(samples)/2)
-        freqs = np.fft.rfftfreq(len(samples), d=1.0/self.sample_rate)
-        nyquist = self.sample_rate / 2
-        low = max(20, min(self.min_frequency, nyquist-1))
-        high = max(low+1, min(self.max_frequency, nyquist))
-        edges = np.geomspace(low, high, self.bar_count+1)
-        raw = np.zeros(self.bar_count, dtype=np.float32)
+        samples=self._latest_samples();samples-=float(np.mean(samples));spectrum=np.abs(np.fft.rfft(samples*np.hanning(len(samples))))/max(1.0,len(samples)/2);freqs=np.fft.rfftfreq(len(samples),d=1.0/self.sample_rate);nyquist=self.sample_rate/2;low=max(20,min(self.min_frequency,nyquist-1));high=max(low+1,min(self.max_frequency,nyquist));edges=np.geomspace(low,high,self.bar_count+1);raw=np.zeros(self.bar_count,dtype=np.float32)
         for i in range(self.bar_count):
-            mask = (freqs >= edges[i]) & (freqs < edges[i+1])
-            if np.any(mask):
-                values = spectrum[mask]
-                raw[i] = float(np.sqrt(np.mean(values * values)))
-        db = 20*np.log10(np.maximum(raw,1e-7)) + 20*math.log10(max(.01,self.sensitivity))
-        target = np.clip((db+65)/65, 0, 1).astype(np.float32)
-        alpha = np.clip(self.smoothing, 0, .95)
-        self._levels = alpha*self._levels + (1-alpha)*target
-        return self._levels
+            mask=(freqs>=edges[i])&(freqs<edges[i+1])
+            if np.any(mask):values=spectrum[mask];raw[i]=float(np.sqrt(np.mean(values*values)))
+        # A wider quiet-signal range makes typical USB microphones much more visible.
+        db=20*np.log10(np.maximum(raw,1e-8))+20*math.log10(max(.01,self.sensitivity));target=np.clip((db+80)/80,0,1).astype(np.float32);alpha=np.clip(self.smoothing,0,.95);self._levels=alpha*self._levels+(1-alpha)*target;return self._levels
 
     @staticmethod
-    def _color(a,b,t):
-        t=max(0,min(1,float(t)))
-        return tuple(int(x+(y-x)*t) for x,y in zip(a,b))
-
+    def _color(a,b,t):t=max(0,min(1,float(t)));return tuple(int(x+(y-x)*t) for x,y in zip(a,b))
     def _render(self):
-        width,height=int(self.display_manager.width),int(self.display_manager.height)
-        image=Image.new('RGB',(width,height),(0,0,0)); draw=ImageDraw.Draw(image)
-        if not self._capture_running():
-            draw.rectangle((0,0,width-1,height-1),outline=(100,0,0))
-            draw.line((0,0,width-1,height-1),fill=(255,0,0)); draw.line((width-1,0,0,height-1),fill=(255,0,0))
-            return image
-        levels=self._spectrum(); usable=max(1,height-1); slot=width/float(self.bar_count)
+        width,height=int(self.display_manager.width),int(self.display_manager.height);image=Image.new('RGB',(width,height),(0,0,0));draw=ImageDraw.Draw(image)
+        if not self._capture_running():draw.rectangle((0,0,width-1,height-1),outline=(100,0,0));draw.line((0,0,width-1,height-1),fill=(255,0,0));draw.line((width-1,0,0,height-1),fill=(255,0,0));return image
+        levels=self._spectrum();usable=max(1,height-1);slot=width/float(self.bar_count)
         for i,level in enumerate(levels):
-            bar=max(0,min(usable,int(round(level*usable))))
-            x0=int(round(i*slot)); x1=max(x0,int(round((i+1)*slot))-1)
-            if x1>x0: x1-=1
-            for y in range(bar):
-                draw.line((x0,height-1-y,x1,height-1-y),fill=self._color(self.color_low,self.color_high,y/max(1,usable-1)))
+            bar=max(0,min(usable,int(round(level*usable))));x0=int(round(i*slot));x1=max(x0,int(round((i+1)*slot))-1)
+            if x1>x0:x1-=1
+            for y in range(bar):draw.line((x0,height-1-y,x1,height-1-y),fill=self._color(self.color_low,self.color_high,y/max(1,usable-1)))
             if self.show_peaks:
-                self._peaks[i]=float(bar) if bar>=self._peaks[i] else max(0,self._peaks[i]-self.peak_decay)
-                py=height-1-int(round(self._peaks[i]))
-                if 0<=py<height: draw.line((x0,py,x1,py),fill=self.color_high)
+                self._peaks[i]=float(bar) if bar>=self._peaks[i] else max(0,self._peaks[i]-self.peak_decay);py=height-1-int(round(self._peaks[i]))
+                if 0<=py<height:draw.line((x0,py,x1,py),fill=self.color_high)
         return image
-
-    def display(self, force_clear=False):
-        try:
-            self.display_manager.image=self._render()
-            self.display_manager.draw=ImageDraw.Draw(self.display_manager.image)
-            self.display_manager.update_display()
-        except Exception as exc:
-            self.logger.error('Audio visualizer render failed: %s', exc, exc_info=True)
-
-    def validate_config(self):
-        return super().validate_config() and self.min_frequency < self.max_frequency
-
+    def display(self,force_clear=False):
+        try:self.display_manager.image=self._render();self.display_manager.draw=ImageDraw.Draw(self.display_manager.image);self.display_manager.update_display()
+        except Exception as exc:self.logger.error('Audio visualizer render failed: %s',exc,exc_info=True)
+    def validate_config(self):return super().validate_config() and self.min_frequency<self.max_frequency
     def get_info(self):
         info=super().get_info()
-        with self._lock: rms=self._current_rms
-        info.update({'audio_input_running':self._capture_running(),'audio_error':self._audio_error,
-            'rms_level':round(rms,5),'audio_active':self.has_live_content(),
-            'input_device':self.input_device or 'auto','sample_rate':self.sample_rate,'fft_size':self.fft_size})
-        return info
+        with self._lock:rms=self._current_rms
+        info.update({'audio_input_running':self._capture_running(),'audio_error':self._audio_error,'rms_level':round(rms,5),'audio_active':self.has_live_content(),'input_device':self.input_device or 'auto','sample_rate':self.sample_rate,'fft_size':self.fft_size});return info

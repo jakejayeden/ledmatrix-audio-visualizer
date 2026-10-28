@@ -99,23 +99,14 @@ class AudioVisualizerPlugin(BasePlugin):
         except Exception as exc:
             self.logger.debug('Runtime config sync skipped: %s', exc)
 
-    def get_display_duration(self):
-        return self.display_duration
-
-    def has_live_priority(self):
-        return self.keep_active
-
-    def has_live_content(self):
-        return self.keep_active
-
-    def get_live_modes(self):
-        return ['audio-visualizer']
-
-    def _capture_running(self):
-        return self._process is not None and self._process.poll() is None
+    def get_display_duration(self): return self.display_duration
+    def has_live_priority(self): return self.keep_active
+    def has_live_content(self): return self.keep_active
+    def get_live_modes(self): return ['audio-visualizer']
+    def _capture_running(self): return self._process is not None and self._process.poll() is None
 
     def _capture_devices(self):
-        """Return ALSA capture devices with stable human-readable identities."""
+        """Return ALSA capture devices using stable ALSA card IDs when available."""
         arecord = shutil.which('arecord') or '/usr/bin/arecord'
         try:
             result = subprocess.run([arecord, '-l'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -124,12 +115,17 @@ class AudioVisualizerPlugin(BasePlugin):
             self.logger.warning('Could not scan capture devices: %s', exc)
             return []
         devices = []
-        pattern = re.compile(r'^card\s+(\d+):\s*(.*?)\s*,\s*device\s+(\d+):\s*(.*?)\s*$', re.MULTILINE)
+        pattern = re.compile(r'^card\s+(\d+):\s*([^\[]+?)\s*\[([^\]]+)\]\s*,\s*device\s+(\d+):\s*([^\[]+?)(?:\s*\[([^\]]+)\])?\s*$', re.MULTILINE)
         for match in pattern.finditer(result.stdout or ''):
-            card, card_name, device, device_name = match.groups()
-            label = '{} {}'.format(card_name.strip(), device_name.strip()).strip()
-            devices.append({'card': int(card), 'device': int(device), 'label': label,
-                            'alsa': 'plughw:{},{}'.format(card, device)})
+            card_num, card_id, card_desc, device_num, device_id, device_desc = match.groups()
+            card_id = card_id.strip()
+            card_desc = card_desc.strip()
+            device_id = device_id.strip()
+            device_desc = (device_desc or '').strip()
+            label = ' '.join(x for x in (card_id, card_desc, device_id, device_desc) if x)
+            stable = 'plughw:CARD={},DEV={}'.format(card_id, device_num)
+            devices.append({'card': int(card_num), 'card_id': card_id, 'device': int(device_num),
+                            'label': label, 'alsa': stable})
         return devices
 
     def _device(self):
@@ -138,15 +134,13 @@ class AudioVisualizerPlugin(BasePlugin):
             text = str(value).strip()
             self._selected_device_name = 'manual override {}'.format(text)
             return 'plughw:' + text + ',0' if text.isdigit() else text
-
         devices = self._capture_devices()
         if not devices:
             self._selected_device_name = None
             return None
-
         if self.microphone_match:
             needle = self.microphone_match.casefold()
-            matches = [d for d in devices if needle in d['label'].casefold()]
+            matches = [d for d in devices if needle in d['label'].casefold() or needle in d['card_id'].casefold()]
             if not matches:
                 self._selected_device_name = None
                 self.logger.warning('Preferred microphone %r is not currently connected. Found: %s',
@@ -154,114 +148,81 @@ class AudioVisualizerPlugin(BasePlugin):
                 return None
             chosen = matches[0]
         else:
+            # Prefer the Jieli UACDemo microphone if present; otherwise choose a USB capture device.
+            preferred = [d for d in devices if 'uacdemo' in d['label'].casefold()]
             usb = [d for d in devices if 'usb' in d['label'].casefold()]
-            chosen = (usb or devices)[0]
-
+            chosen = (preferred or usb or devices)[0]
         self._selected_device_name = chosen['label']
+        self.logger.info('Selected microphone %s via stable ALSA device %s', chosen['label'], chosen['alsa'])
         return chosen['alsa']
 
     def _start_audio(self):
-        if self._capture_running():
-            return
+        if self._capture_running(): return
         self._last_start_attempt = time.monotonic()
         arecord = shutil.which('arecord')
         if not arecord:
-            self._audio_error = 'arecord is unavailable'
-            self.logger.error(self._audio_error)
-            return
+            self._audio_error = 'arecord is unavailable'; self.logger.error(self._audio_error); return
         device = self._device()
         if not device:
-            self._audio_error = ('Preferred microphone {!r} not found'.format(self.microphone_match)
-                                 if self.microphone_match else 'No ALSA capture device found')
-            return
+            self._audio_error = ('Preferred microphone {!r} not found'.format(self.microphone_match) if self.microphone_match else 'No ALSA capture device found'); return
         self._selected_device = device
         command = [arecord, '-q', '-D', device, '-f', 'S16_LE', '-c', '1', '-r', str(self.sample_rate), '-t', 'raw']
         try:
             self._stop_event.clear()
             self._process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
             self._reader = threading.Thread(target=self._read_audio, daemon=True, name='audio-visualizer-capture')
-            self._reader.start()
-            self._audio_error = None
+            self._reader.start(); self._audio_error = None
             self.logger.info('Audio capture started using %s (%s)', self._selected_device_name or 'microphone', device)
         except Exception as exc:
-            self._process = None
-            self._audio_error = str(exc)
-            self.logger.error('Could not start ALSA audio capture: %s', exc, exc_info=True)
+            self._process = None; self._audio_error = str(exc); self.logger.error('Could not start ALSA audio capture: %s', exc, exc_info=True)
 
     def _read_audio(self):
         process = self._process
         try:
             while not self._stop_event.is_set() and process and process.poll() is None:
                 data = process.stdout.read(1024) if process.stdout else b''
-                if not data:
-                    break
+                if not data: break
                 samples = np.frombuffer(data, dtype='<i2').astype(np.float32) / 32768.0
-                if samples.size:
-                    self._accept_samples(samples)
+                if samples.size: self._accept_samples(samples)
         except Exception as exc:
-            if not self._stop_event.is_set():
-                self._audio_error = str(exc)
-                self.logger.error('Audio reader failed: %s', exc, exc_info=True)
+            if not self._stop_event.is_set(): self._audio_error = str(exc); self.logger.error('Audio reader failed: %s', exc, exc_info=True)
         if process and process.poll() is not None and not self._stop_event.is_set():
-            try:
-                error = process.stderr.read().decode(errors='replace').strip() if process.stderr else ''
-            except Exception:
-                error = ''
-            self._audio_error = error or 'arecord exited with code {}'.format(process.returncode)
-            self.logger.error('Audio capture stopped: %s', self._audio_error)
+            try: error = process.stderr.read().decode(errors='replace').strip() if process.stderr else ''
+            except Exception: error = ''
+            self._audio_error = error or 'arecord exited with code {}'.format(process.returncode); self.logger.error('Audio capture stopped: %s', self._audio_error)
 
     def _accept_samples(self, samples):
         rms = float(np.sqrt(np.mean(samples * samples)))
         with self._lock:
-            self._current_rms = rms
-            cap = len(self._audio_buffer)
-            count = min(samples.size, cap)
-            samples = samples[-count:]
-            end = self._buffer_write + count
-            if end <= cap:
-                self._audio_buffer[self._buffer_write:end] = samples
+            self._current_rms = rms; cap = len(self._audio_buffer); count = min(samples.size, cap); samples = samples[-count:]; end = self._buffer_write + count
+            if end <= cap: self._audio_buffer[self._buffer_write:end] = samples
             else:
-                first = cap - self._buffer_write
-                self._audio_buffer[self._buffer_write:] = samples[:first]
-                self._audio_buffer[:count-first] = samples[first:]
-            self._buffer_write = (self._buffer_write + count) % cap
-            self._buffer_filled = min(cap, self._buffer_filled + count)
+                first = cap - self._buffer_write; self._audio_buffer[self._buffer_write:] = samples[:first]; self._audio_buffer[:count-first] = samples[first:]
+            self._buffer_write = (self._buffer_write + count) % cap; self._buffer_filled = min(cap, self._buffer_filled + count)
 
     def _stop_audio(self):
-        self._stop_event.set()
-        process, self._process = self._process, None
+        self._stop_event.set(); process, self._process = self._process, None
         if process:
-            try:
-                process.terminate(); process.wait(timeout=1)
+            try: process.terminate(); process.wait(timeout=1)
             except Exception:
                 try: process.kill()
                 except Exception: pass
         reader, self._reader = self._reader, None
-        if reader and reader.is_alive():
-            reader.join(timeout=1)
+        if reader and reader.is_alive(): reader.join(timeout=1)
 
-    def cleanup(self):
-        self._stop_audio()
-        super().cleanup()
-
+    def cleanup(self): self._stop_audio(); super().cleanup()
     def update(self):
         self._sync_runtime_config()
-        if not self._capture_running() and time.monotonic() - self._last_start_attempt >= 2.0:
-            self._start_audio()
+        if not self._capture_running() and time.monotonic() - self._last_start_attempt >= 2.0: self._start_audio()
 
     def _latest_samples(self):
         with self._lock:
-            n = min(self._buffer_filled, self.fft_size)
-            result = np.zeros(self.fft_size, dtype=np.float32)
+            n = min(self._buffer_filled, self.fft_size); result = np.zeros(self.fft_size, dtype=np.float32)
             if n <= 0: return result
-            output = self.fft_size - n
-            start = (self._buffer_write - n) % len(self._audio_buffer)
-            end = start + n
+            output = self.fft_size - n; start = (self._buffer_write - n) % len(self._audio_buffer); end = start + n
             if end <= len(self._audio_buffer): result[output:] = self._audio_buffer[start:end]
             else:
-                first = len(self._audio_buffer) - start
-                result[output:output+first] = self._audio_buffer[start:]
-                result[output+first:] = self._audio_buffer[:n-first]
+                first = len(self._audio_buffer) - start; result[output:output+first] = self._audio_buffer[start:]; result[output+first:] = self._audio_buffer[:n-first]
             return result
 
     def _recent_rms(self, seconds=0.300):
@@ -272,100 +233,65 @@ class AudioVisualizerPlugin(BasePlugin):
             start = (self._buffer_write - n) % len(self._audio_buffer); end = start + n
             if end <= len(self._audio_buffer): samples = self._audio_buffer[start:end].copy()
             else:
-                first = len(self._audio_buffer) - start
-                samples = np.concatenate((self._audio_buffer[start:].copy(), self._audio_buffer[:n-first].copy()))
+                first = len(self._audio_buffer) - start; samples = np.concatenate((self._audio_buffer[start:].copy(), self._audio_buffer[:n-first].copy()))
         if samples.size <= 0: return 0.0
-        samples -= float(np.mean(samples))
-        return float(np.sqrt(np.mean(samples * samples)))
+        samples -= float(np.mean(samples)); return float(np.sqrt(np.mean(samples * samples)))
 
     @staticmethod
     def _frequency_compensation(frequencies):
-        calibration_hz = np.array([100.0, 500.0, 1000.0, 3000.0, 6000.0], dtype=np.float64)
-        calibration_gain = np.array([90.51, 64.0, 90.51, 181.02, 1448.15], dtype=np.float64)
-        f = np.clip(np.asarray(frequencies, dtype=np.float64), calibration_hz[0], calibration_hz[-1])
-        return np.exp(np.interp(np.log(f), np.log(calibration_hz), np.log(calibration_gain))).astype(np.float32)
+        calibration_hz=np.array([100.,500.,1000.,3000.,6000.]); calibration_gain=np.array([90.51,64.,90.51,181.02,1448.15]); f=np.clip(np.asarray(frequencies,dtype=np.float64),calibration_hz[0],calibration_hz[-1]); return np.exp(np.interp(np.log(f),np.log(calibration_hz),np.log(calibration_gain))).astype(np.float32)
 
     def _spectrum(self):
-        samples = self._latest_samples(); samples -= float(np.mean(samples))
-        spectrum = np.abs(np.fft.rfft(samples * np.hanning(len(samples)))) / max(1.0, len(samples) / 2)
-        freqs = np.fft.rfftfreq(len(samples), d=1.0 / self.sample_rate); nyquist = self.sample_rate / 2
-        low = max(20, min(self.min_frequency, nyquist - 1)); high = max(low + 1, min(self.max_frequency, nyquist))
-        edges = np.geomspace(low, high, self.bar_count + 1); raw = np.zeros(self.bar_count, dtype=np.float32)
-        centres = np.sqrt(edges[:-1] * edges[1:])
+        samples=self._latest_samples(); samples-=float(np.mean(samples)); spectrum=np.abs(np.fft.rfft(samples*np.hanning(len(samples))))/max(1.0,len(samples)/2); freqs=np.fft.rfftfreq(len(samples),d=1.0/self.sample_rate); nyquist=self.sample_rate/2; low=max(20,min(self.min_frequency,nyquist-1)); high=max(low+1,min(self.max_frequency,nyquist)); edges=np.geomspace(low,high,self.bar_count+1); raw=np.zeros(self.bar_count,dtype=np.float32); centres=np.sqrt(edges[:-1]*edges[1:])
         for i in range(self.bar_count):
-            mask = (freqs >= edges[i]) & (freqs < edges[i+1])
-            if np.any(mask):
-                values = spectrum[mask]; raw[i] = float(np.sqrt(np.mean(values * values)))
-        corrected = np.maximum(raw * self._frequency_compensation(centres) * (max(0.01, self.sensitivity) / 4.0) * 0.5, 1e-8)
-        target = np.clip((20.0 * np.log10(corrected) + 70.0) / 30.0, 0, 1).astype(np.float32)
-        smoothing = float(np.clip(self.smoothing, 0, .95)); attack = 0.82 - 0.12*smoothing; release = 0.42 - 0.12*smoothing
-        response = np.where(target >= self._levels, attack, release).astype(np.float32)
-        self._levels += (target-self._levels)*response; self._levels = np.clip(self._levels,0,1)
-        return self._levels
+            mask=(freqs>=edges[i])&(freqs<edges[i+1])
+            if np.any(mask): values=spectrum[mask]; raw[i]=float(np.sqrt(np.mean(values*values)))
+        corrected=np.maximum(raw*self._frequency_compensation(centres)*(max(.01,self.sensitivity)/4.)*.5,1e-8); target=np.clip((20*np.log10(corrected)+70)/30,0,1).astype(np.float32); smoothing=float(np.clip(self.smoothing,0,.95)); attack=.82-.12*smoothing; release=.42-.12*smoothing; response=np.where(target>=self._levels,attack,release).astype(np.float32); self._levels+=(target-self._levels)*response; self._levels=np.clip(self._levels,0,1); return self._levels
 
     def _debug_sensitivity_levels(self):
-        samples=self._latest_samples(); samples-=float(np.mean(samples))
-        spectrum=np.abs(np.fft.rfft(samples*np.hanning(len(samples))))/max(1.0,len(samples)/2)
-        freqs=np.fft.rfftfreq(len(samples),d=1.0/self.sample_rate); target_hz=max(20.0,min(self.debug_frequency,self.sample_rate/2.0-1.0))
-        centre=int(np.argmin(np.abs(freqs-target_hz))); values=spectrum[max(0,centre-1):min(len(spectrum),centre+2)]
-        raw=float(np.sqrt(np.mean(values*values))) if values.size else 0.0; sensitivities=np.power(2.0,np.arange(16,dtype=np.float32))
-        db=20.0*np.log10(max(raw,1e-8))+20.0*np.log10(sensitivities/8.0); target=np.clip((db+70.0)/30.0,0,1).astype(np.float32)
-        smoothing=float(np.clip(self.smoothing,0,.95)); attack=0.82-0.12*smoothing; release=0.42-0.12*smoothing
-        response=np.where(target>=self._debug_levels,attack,release).astype(np.float32); self._debug_levels+=(target-self._debug_levels)*response
-        self._debug_levels=np.clip(self._debug_levels,0,1); return self._debug_levels
+        samples=self._latest_samples(); samples-=float(np.mean(samples)); spectrum=np.abs(np.fft.rfft(samples*np.hanning(len(samples))))/max(1.,len(samples)/2); freqs=np.fft.rfftfreq(len(samples),d=1./self.sample_rate); target_hz=max(20.,min(self.debug_frequency,self.sample_rate/2.-1)); centre=int(np.argmin(np.abs(freqs-target_hz))); values=spectrum[max(0,centre-1):min(len(spectrum),centre+2)]; raw=float(np.sqrt(np.mean(values*values))) if values.size else 0.; sensitivities=np.power(2.,np.arange(16,dtype=np.float32)); db=20*np.log10(max(raw,1e-8))+20*np.log10(sensitivities/8.); target=np.clip((db+70)/30,0,1).astype(np.float32); smoothing=float(np.clip(self.smoothing,0,.95)); attack=.82-.12*smoothing; release=.42-.12*smoothing; response=np.where(target>=self._debug_levels,attack,release).astype(np.float32); self._debug_levels+=(target-self._debug_levels)*response; self._debug_levels=np.clip(self._debug_levels,0,1); return self._debug_levels
 
     @staticmethod
-    def _color(a,b,t):
-        t=max(0,min(1,float(t))); return tuple(int(x+(y-x)*t) for x,y in zip(a,b))
+    def _color(a,b,t): t=max(0,min(1,float(t))); return tuple(int(x+(y-x)*t) for x,y in zip(a,b))
 
     def _render_spectrum(self,image,draw,width,height,falling=False):
         levels=self._spectrum(); usable=max(1,height-1); slot=width/float(self.bar_count)
         for i,level in enumerate(levels):
-            bar=max(0,min(usable,int(round(level*usable)))); x0=int(round(i*slot)); x1=max(x0,int(round((i+1)*slot))-1)
-            if x1>x0: x1-=1
+            bar=max(0,min(usable,int(round(level*usable)))); x0=int(round(i*slot)); x1=max(x0,int(round((i+1)*slot))-1); x1=x1-1 if x1>x0 else x1
             for y in range(bar): draw.line((x0,height-1-y,x1,height-1-y),fill=self._color(self.color_low,self.color_high,y/max(1,usable-1)))
             if falling:
-                self._peaks[i]=float(bar) if bar>=self._peaks[i] else max(float(bar),self._peaks[i]-max(0.05,self.peak_decay*0.5))
-                py=height-1-int(round(self._peaks[i]));
+                self._peaks[i]=float(bar) if bar>=self._peaks[i] else max(float(bar),self._peaks[i]-max(.05,self.peak_decay*.5)); py=height-1-int(round(self._peaks[i]));
                 if 0<=py<height: draw.line((x0,py,x1,py),fill=(255,0,0))
             elif self.show_peaks:
-                self._peaks[i]=float(bar) if bar>=self._peaks[i] else max(0,self._peaks[i]-self.peak_decay); py=height-1-int(round(self._peaks[i]))
+                self._peaks[i]=float(bar) if bar>=self._peaks[i] else max(0,self._peaks[i]-self.peak_decay); py=height-1-int(round(self._peaks[i]));
                 if 0<=py<height: draw.line((x0,py,x1,py),fill=self.color_high)
 
     def _render_debug_sensitivity(self,image,draw,width,height):
-        levels=self._debug_sensitivity_levels(); usable=max(1,height-1); slot=width/16.0
+        levels=self._debug_sensitivity_levels(); usable=max(1,height-1); slot=width/16.
         for i,level in enumerate(levels):
             bar=max(0,min(usable,int(round(float(level)*usable)))); x0=int(round(i*slot)); x1=max(x0,int(round((i+1)*slot))-2)
             for y in range(bar): draw.line((x0,height-1-y,x1,height-1-y),fill=self._color(self.color_low,self.color_high,y/max(1,usable-1)))
 
     def _render_analog(self,image,draw,width,height):
-        rms=self._recent_rms(0.300); input_db=20.0*math.log10(max(rms,1e-9)); gain_db=20.0*math.log10(max(0.01,self.sensitivity)/4.0)
-        target_vu_db=input_db+44.5+gain_db; now=time.monotonic()
+        rms=self._recent_rms(.300); input_db=20*math.log10(max(rms,1e-9)); gain_db=20*math.log10(max(.01,self.sensitivity)/4.); target_vu_db=input_db+44.5+gain_db; now=time.monotonic()
         if self._vu_envelope is None or self._vu_last_update is None: self._vu_envelope=target_vu_db
         else:
-            dt=max(0.001,min(0.25,now-self._vu_last_update)); tau=0.12 if target_vu_db>self._vu_envelope else 0.22
-            self._vu_envelope+=(target_vu_db-self._vu_envelope)*(1.0-math.exp(-dt/tau))
-        self._vu_last_update=now; vu_db=max(-20.0,min(3.0,self._vu_envelope))
-        scale=[(-20.0,0.00),(-10.0,0.25),(-7.0,0.39),(-5.0,0.50),(-3.0,0.62),(0.0,0.82),(3.0,1.00)]; level=0.0
+            dt=max(.001,min(.25,now-self._vu_last_update)); tau=.12 if target_vu_db>self._vu_envelope else .22; alpha=1-math.exp(-dt/tau); self._vu_envelope+=(target_vu_db-self._vu_envelope)*alpha
+        self._vu_last_update=now; vu_db=max(-20.,min(3.,self._vu_envelope)); scale=[(-20.,0.),(-10.,.25),(-7.,.39),(-5.,.50),(-3.,.62),(0.,.82),(3.,1.)]; level=0.
         for i in range(len(scale)-1):
             db0,p0=scale[i]; db1,p1=scale[i+1]
-            if vu_db<=db1:
-                fraction=(vu_db-db0)/(db1-db0) if db1!=db0 else 0.0; level=p0+(p1-p0)*max(0.0,min(1.0,fraction)); break
-        else: level=1.0
-        self._needle_level+=(level-self._needle_level)*0.45; cx=width//2; cy=height+10; radius=max(18,min(width//2-3,height+7)); start=math.radians(205); end=math.radians(335)
+            if vu_db<=db1: fraction=(vu_db-db0)/(db1-db0) if db1!=db0 else 0.; level=p0+(p1-p0)*max(0.,min(1.,fraction)); break
+        else: level=1.
+        self._needle_level+=(level-self._needle_level)*.45; cx=width//2; cy=height+10; radius=max(18,min(width//2-3,height+7)); start=math.radians(205); end=math.radians(335)
         def point(angle,r): return (int(round(cx+math.cos(angle)*r)),int(round(cy+math.sin(angle)*r)))
         draw.arc((cx-radius,cy-radius,cx+radius,cy+radius),start=205,end=335,fill=(100,100,60),width=1)
-        labels=[(-20,0.00),(-10,0.25),(-7,0.39),(-5,0.50),(-3,0.62),(0,0.82),(3,1.00)]
-        for db_value,pos in labels:
-            a=start+(end-start)*pos; outer=point(a,radius); inner=point(a,radius-4); color=(255,50,20) if db_value>=0 else ((255,190,20) if db_value>=-5 else (80,220,80))
-            draw.line((inner[0],inner[1],outer[0],outer[1]),fill=color); text=str(db_value) if db_value<0 else ('0' if db_value==0 else '+3'); tx,ty=point(a,radius-9); draw.text((tx-len(text)*3,ty-3),text,fill=color)
-        draw.text((max(0,cx-6),0),'VU',fill=(255,255,255)); angle=start+(end-start)*self._needle_level; tip=point(angle,radius-2)
-        draw.line((cx,cy,tip[0],tip[1]),fill=(255,40,20),width=2); draw.ellipse((cx-2,height-3,cx+2,height+1),fill=(220,180,80))
+        for db_value,pos in [(-20,0.),(-10,.25),(-7,.39),(-5,.50),(-3,.62),(0,.82),(3,1.)]:
+            a=start+(end-start)*pos; outer=point(a,radius); inner=point(a,radius-4); color=(255,50,20) if db_value>=0 else ((255,190,20) if db_value>=-5 else (80,220,80)); draw.line((inner[0],inner[1],outer[0],outer[1]),fill=color); text=str(db_value) if db_value<0 else ('0' if db_value==0 else '+3'); tx,ty=point(a,radius-9); draw.text((tx-len(text)*3,ty-3),text,fill=color)
+        draw.text((max(0,cx-6),0),'VU',fill=(255,255,255)); angle=start+(end-start)*self._needle_level; tip=point(angle,radius-2); draw.line((cx,cy,tip[0],tip[1]),fill=(255,40,20),width=2); draw.ellipse((cx-2,height-3,cx+2,height+1),fill=(220,180,80))
 
     def _render(self):
         width,height=int(self.display_manager.width),int(self.display_manager.height); image=Image.new('RGB',(width,height),(0,0,0)); draw=ImageDraw.Draw(image)
-        if not self._capture_running():
-            draw.rectangle((0,0,width-1,height-1),outline=(100,0,0)); draw.line((0,0,width-1,height-1),fill=(255,0,0)); draw.line((width-1,0,0,height-1),fill=(255,0,0)); return image
+        if not self._capture_running(): draw.rectangle((0,0,width-1,height-1),outline=(100,0,0)); draw.line((0,0,width-1,height-1),fill=(255,0,0)); draw.line((width-1,0,0,height-1),fill=(255,0,0)); return image
         if self.vu_mode=='analog_needle': self._render_analog(image,draw,width,height)
         elif self.vu_mode=='spectrum_falling': self._render_spectrum(image,draw,width,height,falling=True)
         elif self.vu_mode=='debug_sensitivity': self._render_debug_sensitivity(image,draw,width,height)
@@ -373,15 +299,11 @@ class AudioVisualizerPlugin(BasePlugin):
         return image
 
     def display(self,force_clear=False):
-        try:
-            self.display_manager.image=self._render(); self.display_manager.draw=ImageDraw.Draw(self.display_manager.image); self.display_manager.update_display()
+        try: self.display_manager.image=self._render(); self.display_manager.draw=ImageDraw.Draw(self.display_manager.image); self.display_manager.update_display()
         except Exception as exc: self.logger.error('Audio visualizer render failed: %s',exc,exc_info=True)
 
-    def validate_config(self):
-        return super().validate_config() and self.min_frequency<self.max_frequency
-
+    def validate_config(self): return super().validate_config() and self.min_frequency<self.max_frequency
     def get_info(self):
         info=super().get_info()
         with self._lock: rms=self._current_rms
-        info.update({'audio_input_running':self._capture_running(),'audio_error':self._audio_error,'rms_level':round(rms,5),'keep_active':self.keep_active,'vu_mode':self.vu_mode,'input_device':self.input_device or 'auto','microphone_match':self.microphone_match,'selected_microphone':self._selected_device_name,'selected_alsa_device':self._selected_device,'sample_rate':self.sample_rate,'fft_size':self.fft_size})
-        return info
+        info.update({'audio_input_running':self._capture_running(),'audio_error':self._audio_error,'rms_level':round(rms,5),'keep_active':self.keep_active,'vu_mode':self.vu_mode,'microphone_match':self.microphone_match or 'auto','selected_microphone':self._selected_device_name,'selected_alsa_device':self._selected_device,'input_device':self.input_device or 'auto','sample_rate':self.sample_rate,'fft_size':self.fft_size}); return info

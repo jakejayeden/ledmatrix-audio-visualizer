@@ -6,7 +6,8 @@
   "properties": {
     "enabled": {"type":"boolean","default":true,"description":"Enable or disable this plugin"},
     "vu_mode": {"type":"string","default":"spectrum","enum":["spectrum","spectrum_falling","analog_needle","debug_sensitivity"],"enumNames":["Spectrum Bars","Spectrum Falling","Analog Needle VU Meter","Debug: Sensitivity Calibration"],"description":"Choose the visualizer style."},
-    "input_device": {"type":["string","integer","null"],"default":null,"description":"ALSA capture device. Leave blank for automatic USB microphone detection."},
+    "microphone_match": {"type":"string","default":"","description":"Preferred microphone name, for example UACDemoV1.0 or USB Audio. The plugin finds this capture device again even if its ALSA card number changes after moving USB ports. Leave blank to automatically prefer a USB capture device."},
+    "input_device": {"type":["string","integer","null"],"default":null,"description":"Advanced ALSA device override such as plughw:1,0. Leave blank/auto to use microphone detection above."},
     "sensitivity": {"type":"number","default":4.0,"minimum":0.1,"maximum":50.0,"multipleOf":0.1,"description":"Visual microphone gain. 4.0 is the calibrated default."},
     "debug_frequency": {"type":"number","default":1000,"minimum":20,"maximum":20000,"description":"Frequency sampled by Debug: Sensitivity Calibration. All 16 debug bars sample this same frequency."},
     "keep_active": {"type":"boolean","default":false,"description":"Keep the Audio Visualizer on screen continuously and prevent normal plugin rotation. Disable to make it participate in the normal rotation."},

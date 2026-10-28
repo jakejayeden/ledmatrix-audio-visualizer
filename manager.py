@@ -18,9 +18,11 @@ class AudioVisualizerPlugin(BasePlugin):
         self._audio_buffer = np.zeros(8192, dtype=np.float32)
         self._buffer_write = 0
         self._buffer_filled = 0
-        self._last_audio_active_at = float('-inf')
         self._current_rms = 0.0
         self._audio_error = None
+        self._selected_device = None
+        self._selected_device_name = None
+        self._last_start_attempt = 0.0
         self._levels = np.zeros(16, dtype=np.float32)
         self._peaks = np.zeros(16, dtype=np.float32)
         self._debug_levels = np.zeros(16, dtype=np.float32)
@@ -34,6 +36,7 @@ class AudioVisualizerPlugin(BasePlugin):
 
     def _load_config(self, c):
         self.input_device = c.get('input_device')
+        self.microphone_match = str(c.get('microphone_match', '') or '').strip()
         self.vu_mode = str(c.get('vu_mode', 'spectrum'))
         self.sensitivity = float(c.get('sensitivity', 4.0))
         self.debug_frequency = float(c.get('debug_frequency', 1000.0))
@@ -54,8 +57,6 @@ class AudioVisualizerPlugin(BasePlugin):
         if len(self._levels) != self.bar_count:
             self._levels = np.zeros(self.bar_count, dtype=np.float32)
             self._peaks = np.zeros(self.bar_count, dtype=np.float32)
-        # Keep at least half a second of audio so the analog meter can use a
-        # genuine 300 ms programme-level integration window.
         wanted = max(self.fft_size * 4, int(self.sample_rate * 0.5), 4096)
         with self._lock:
             if len(self._audio_buffer) != wanted:
@@ -63,7 +64,7 @@ class AudioVisualizerPlugin(BasePlugin):
                 self._buffer_write = self._buffer_filled = 0
 
     def on_config_change(self, new_config):
-        old_audio = (self.input_device, self.sample_rate, self.fft_size)
+        old_audio = (self.input_device, self.microphone_match, self.sample_rate, self.fft_size)
         old_mode = self.vu_mode
         super().on_config_change(new_config)
         self.config = new_config
@@ -76,12 +77,11 @@ class AudioVisualizerPlugin(BasePlugin):
             self._peaks.fill(0)
             self._debug_levels.fill(0)
             self.logger.info('VU mode changed from %s to %s', old_mode, self.vu_mode)
-        if old_audio != (self.input_device, self.sample_rate, self.fft_size):
+        if old_audio != (self.input_device, self.microphone_match, self.sample_rate, self.fft_size):
             self._stop_audio()
             self._start_audio()
 
     def _sync_runtime_config(self):
-        """Fallback for LEDMatrix builds/save paths that miss on_config_change."""
         now = time.monotonic()
         if now - self._last_config_sync < 0.5:
             return
@@ -103,11 +103,9 @@ class AudioVisualizerPlugin(BasePlugin):
         return self.display_duration
 
     def has_live_priority(self):
-        """Use LEDMatrix live priority as a persistent user-controlled pin."""
         return self.keep_active
 
     def has_live_content(self):
-        """When pinned, the visualizer is always live so rotation stays paused."""
         return self.keep_active
 
     def get_live_modes(self):
@@ -116,29 +114,67 @@ class AudioVisualizerPlugin(BasePlugin):
     def _capture_running(self):
         return self._process is not None and self._process.poll() is None
 
+    def _capture_devices(self):
+        """Return ALSA capture devices with stable human-readable identities."""
+        arecord = shutil.which('arecord') or '/usr/bin/arecord'
+        try:
+            result = subprocess.run([arecord, '-l'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                    text=True, timeout=3, check=False)
+        except Exception as exc:
+            self.logger.warning('Could not scan capture devices: %s', exc)
+            return []
+        devices = []
+        pattern = re.compile(r'^card\s+(\d+):\s*(.*?)\s*,\s*device\s+(\d+):\s*(.*?)\s*$', re.MULTILINE)
+        for match in pattern.finditer(result.stdout or ''):
+            card, card_name, device, device_name = match.groups()
+            label = '{} {}'.format(card_name.strip(), device_name.strip()).strip()
+            devices.append({'card': int(card), 'device': int(device), 'label': label,
+                            'alsa': 'plughw:{},{}'.format(card, device)})
+        return devices
+
     def _device(self):
         value = self.input_device
         if value not in (None, '', 'default', 'auto'):
             text = str(value).strip()
+            self._selected_device_name = 'manual override {}'.format(text)
             return 'plughw:' + text + ',0' if text.isdigit() else text
-        try:
-            result = subprocess.run(['/usr/bin/arecord', '-l'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=3, check=False)
-            match = re.search(r'^card\s+(\d+):.*?device\s+(\d+):', result.stdout, re.MULTILINE)
-            if match:
-                return 'plughw:{},{}'.format(match.group(1), match.group(2))
-        except Exception as exc:
-            self.logger.warning('Could not auto-detect microphone: %s', exc)
-        return 'default'
+
+        devices = self._capture_devices()
+        if not devices:
+            self._selected_device_name = None
+            return None
+
+        if self.microphone_match:
+            needle = self.microphone_match.casefold()
+            matches = [d for d in devices if needle in d['label'].casefold()]
+            if not matches:
+                self._selected_device_name = None
+                self.logger.warning('Preferred microphone %r is not currently connected. Found: %s',
+                                    self.microphone_match, ', '.join(d['label'] for d in devices))
+                return None
+            chosen = matches[0]
+        else:
+            usb = [d for d in devices if 'usb' in d['label'].casefold()]
+            chosen = (usb or devices)[0]
+
+        self._selected_device_name = chosen['label']
+        return chosen['alsa']
 
     def _start_audio(self):
         if self._capture_running():
             return
+        self._last_start_attempt = time.monotonic()
         arecord = shutil.which('arecord')
         if not arecord:
             self._audio_error = 'arecord is unavailable'
             self.logger.error(self._audio_error)
             return
         device = self._device()
+        if not device:
+            self._audio_error = ('Preferred microphone {!r} not found'.format(self.microphone_match)
+                                 if self.microphone_match else 'No ALSA capture device found')
+            return
+        self._selected_device = device
         command = [arecord, '-q', '-D', device, '-f', 'S16_LE', '-c', '1', '-r', str(self.sample_rate), '-t', 'raw']
         try:
             self._stop_event.clear()
@@ -146,7 +182,7 @@ class AudioVisualizerPlugin(BasePlugin):
             self._reader = threading.Thread(target=self._read_audio, daemon=True, name='audio-visualizer-capture')
             self._reader.start()
             self._audio_error = None
-            self.logger.info('Audio capture started using ALSA device %s', device)
+            self.logger.info('Audio capture started using %s (%s)', self._selected_device_name or 'microphone', device)
         except Exception as exc:
             self._process = None
             self._audio_error = str(exc)
@@ -196,13 +232,10 @@ class AudioVisualizerPlugin(BasePlugin):
         process, self._process = self._process, None
         if process:
             try:
-                process.terminate()
-                process.wait(timeout=1)
+                process.terminate(); process.wait(timeout=1)
             except Exception:
-                try:
-                    process.kill()
-                except Exception:
-                    pass
+                try: process.kill()
+                except Exception: pass
         reader, self._reader = self._reader, None
         if reader and reader.is_alive():
             reader.join(timeout=1)
@@ -213,20 +246,18 @@ class AudioVisualizerPlugin(BasePlugin):
 
     def update(self):
         self._sync_runtime_config()
-        if not self._capture_running():
+        if not self._capture_running() and time.monotonic() - self._last_start_attempt >= 2.0:
             self._start_audio()
 
     def _latest_samples(self):
         with self._lock:
             n = min(self._buffer_filled, self.fft_size)
             result = np.zeros(self.fft_size, dtype=np.float32)
-            if n <= 0:
-                return result
+            if n <= 0: return result
             output = self.fft_size - n
             start = (self._buffer_write - n) % len(self._audio_buffer)
             end = start + n
-            if end <= len(self._audio_buffer):
-                result[output:] = self._audio_buffer[start:end]
+            if end <= len(self._audio_buffer): result[output:] = self._audio_buffer[start:end]
             else:
                 first = len(self._audio_buffer) - start
                 result[output:output+first] = self._audio_buffer[start:]
@@ -234,229 +265,123 @@ class AudioVisualizerPlugin(BasePlugin):
             return result
 
     def _recent_rms(self, seconds=0.300):
-        """RMS over the most recent audio window, used by the analog VU meter."""
         wanted = max(1, int(self.sample_rate * seconds))
         with self._lock:
             n = min(self._buffer_filled, wanted)
-            if n <= 0:
-                return 0.0
-            start = (self._buffer_write - n) % len(self._audio_buffer)
-            end = start + n
-            if end <= len(self._audio_buffer):
-                samples = self._audio_buffer[start:end].copy()
+            if n <= 0: return 0.0
+            start = (self._buffer_write - n) % len(self._audio_buffer); end = start + n
+            if end <= len(self._audio_buffer): samples = self._audio_buffer[start:end].copy()
             else:
                 first = len(self._audio_buffer) - start
                 samples = np.concatenate((self._audio_buffer[start:].copy(), self._audio_buffer[:n-first].copy()))
-        if samples.size <= 0:
-            return 0.0
+        if samples.size <= 0: return 0.0
         samples -= float(np.mean(samples))
         return float(np.sqrt(np.mean(samples * samples)))
 
     @staticmethod
     def _frequency_compensation(frequencies):
-        """Measured visual gain curve from the 16-bar sensitivity calibration."""
         calibration_hz = np.array([100.0, 500.0, 1000.0, 3000.0, 6000.0], dtype=np.float64)
         calibration_gain = np.array([90.51, 64.0, 90.51, 181.02, 1448.15], dtype=np.float64)
         f = np.clip(np.asarray(frequencies, dtype=np.float64), calibration_hz[0], calibration_hz[-1])
-        log_gain = np.interp(np.log(f), np.log(calibration_hz), np.log(calibration_gain))
-        return np.exp(log_gain).astype(np.float32)
+        return np.exp(np.interp(np.log(f), np.log(calibration_hz), np.log(calibration_gain))).astype(np.float32)
 
     def _spectrum(self):
-        samples = self._latest_samples()
-        samples -= float(np.mean(samples))
+        samples = self._latest_samples(); samples -= float(np.mean(samples))
         spectrum = np.abs(np.fft.rfft(samples * np.hanning(len(samples)))) / max(1.0, len(samples) / 2)
-        freqs = np.fft.rfftfreq(len(samples), d=1.0 / self.sample_rate)
-        nyquist = self.sample_rate / 2
-        low = max(20, min(self.min_frequency, nyquist - 1))
-        high = max(low + 1, min(self.max_frequency, nyquist))
-        edges = np.geomspace(low, high, self.bar_count + 1)
-        raw = np.zeros(self.bar_count, dtype=np.float32)
+        freqs = np.fft.rfftfreq(len(samples), d=1.0 / self.sample_rate); nyquist = self.sample_rate / 2
+        low = max(20, min(self.min_frequency, nyquist - 1)); high = max(low + 1, min(self.max_frequency, nyquist))
+        edges = np.geomspace(low, high, self.bar_count + 1); raw = np.zeros(self.bar_count, dtype=np.float32)
         centres = np.sqrt(edges[:-1] * edges[1:])
         for i in range(self.bar_count):
             mask = (freqs >= edges[i]) & (freqs < edges[i+1])
             if np.any(mask):
-                values = spectrum[mask]
-                raw[i] = float(np.sqrt(np.mean(values * values)))
-        compensation = self._frequency_compensation(centres)
-        user_gain = max(0.01, self.sensitivity) / 4.0
-        corrected = np.maximum(raw * compensation * user_gain * 0.5, 1e-8)
-        db = 20.0 * np.log10(corrected)
-        target = np.clip((db + 70.0) / 30.0, 0, 1).astype(np.float32)
-        smoothing = float(np.clip(self.smoothing, 0, .95))
-        attack = 0.82 - (0.12 * smoothing)
-        release = 0.42 - (0.12 * smoothing)
+                values = spectrum[mask]; raw[i] = float(np.sqrt(np.mean(values * values)))
+        corrected = np.maximum(raw * self._frequency_compensation(centres) * (max(0.01, self.sensitivity) / 4.0) * 0.5, 1e-8)
+        target = np.clip((20.0 * np.log10(corrected) + 70.0) / 30.0, 0, 1).astype(np.float32)
+        smoothing = float(np.clip(self.smoothing, 0, .95)); attack = 0.82 - 0.12*smoothing; release = 0.42 - 0.12*smoothing
         response = np.where(target >= self._levels, attack, release).astype(np.float32)
-        self._levels += (target - self._levels) * response
-        self._levels = np.clip(self._levels, 0, 1)
+        self._levels += (target-self._levels)*response; self._levels = np.clip(self._levels,0,1)
         return self._levels
 
     def _debug_sensitivity_levels(self):
-        """Measure one frequency with 16 sensitivities: 1, 2, 4 ... 32768."""
-        samples = self._latest_samples()
-        samples -= float(np.mean(samples))
-        spectrum = np.abs(np.fft.rfft(samples * np.hanning(len(samples)))) / max(1.0, len(samples) / 2)
-        freqs = np.fft.rfftfreq(len(samples), d=1.0 / self.sample_rate)
-        target_hz = max(20.0, min(self.debug_frequency, self.sample_rate / 2.0 - 1.0))
-        centre = int(np.argmin(np.abs(freqs - target_hz)))
-        lo = max(0, centre - 1)
-        hi = min(len(spectrum), centre + 2)
-        values = spectrum[lo:hi]
-        raw = float(np.sqrt(np.mean(values * values))) if values.size else 0.0
-        sensitivities = np.power(2.0, np.arange(16, dtype=np.float32))
-        db = 20.0 * np.log10(max(raw, 1e-8)) + 20.0 * np.log10(sensitivities / 8.0)
-        target = np.clip((db + 70.0) / 30.0, 0, 1).astype(np.float32)
-        smoothing = float(np.clip(self.smoothing, 0, .95))
-        attack = 0.82 - (0.12 * smoothing)
-        release = 0.42 - (0.12 * smoothing)
-        response = np.where(target >= self._debug_levels, attack, release).astype(np.float32)
-        self._debug_levels += (target - self._debug_levels) * response
-        self._debug_levels = np.clip(self._debug_levels, 0, 1)
-        return self._debug_levels
+        samples=self._latest_samples(); samples-=float(np.mean(samples))
+        spectrum=np.abs(np.fft.rfft(samples*np.hanning(len(samples))))/max(1.0,len(samples)/2)
+        freqs=np.fft.rfftfreq(len(samples),d=1.0/self.sample_rate); target_hz=max(20.0,min(self.debug_frequency,self.sample_rate/2.0-1.0))
+        centre=int(np.argmin(np.abs(freqs-target_hz))); values=spectrum[max(0,centre-1):min(len(spectrum),centre+2)]
+        raw=float(np.sqrt(np.mean(values*values))) if values.size else 0.0; sensitivities=np.power(2.0,np.arange(16,dtype=np.float32))
+        db=20.0*np.log10(max(raw,1e-8))+20.0*np.log10(sensitivities/8.0); target=np.clip((db+70.0)/30.0,0,1).astype(np.float32)
+        smoothing=float(np.clip(self.smoothing,0,.95)); attack=0.82-0.12*smoothing; release=0.42-0.12*smoothing
+        response=np.where(target>=self._debug_levels,attack,release).astype(np.float32); self._debug_levels+=(target-self._debug_levels)*response
+        self._debug_levels=np.clip(self._debug_levels,0,1); return self._debug_levels
 
     @staticmethod
-    def _color(a, b, t):
-        t = max(0, min(1, float(t)))
-        return tuple(int(x + (y - x) * t) for x, y in zip(a, b))
+    def _color(a,b,t):
+        t=max(0,min(1,float(t))); return tuple(int(x+(y-x)*t) for x,y in zip(a,b))
 
-    def _render_spectrum(self, image, draw, width, height, falling=False):
-        levels = self._spectrum()
-        usable = max(1, height - 1)
-        slot = width / float(self.bar_count)
-        for i, level in enumerate(levels):
-            bar = max(0, min(usable, int(round(level * usable))))
-            x0 = int(round(i * slot))
-            x1 = max(x0, int(round((i + 1) * slot)) - 1)
-            if x1 > x0:
-                x1 -= 1
-            for y in range(bar):
-                draw.line((x0, height-1-y, x1, height-1-y), fill=self._color(self.color_low, self.color_high, y / max(1, usable-1)))
+    def _render_spectrum(self,image,draw,width,height,falling=False):
+        levels=self._spectrum(); usable=max(1,height-1); slot=width/float(self.bar_count)
+        for i,level in enumerate(levels):
+            bar=max(0,min(usable,int(round(level*usable)))); x0=int(round(i*slot)); x1=max(x0,int(round((i+1)*slot))-1)
+            if x1>x0: x1-=1
+            for y in range(bar): draw.line((x0,height-1-y,x1,height-1-y),fill=self._color(self.color_low,self.color_high,y/max(1,usable-1)))
             if falling:
-                if bar >= self._peaks[i]:
-                    self._peaks[i] = float(bar)
-                else:
-                    self._peaks[i] = max(float(bar), self._peaks[i] - max(0.05, self.peak_decay * 0.5))
-                py = height - 1 - int(round(self._peaks[i]))
-                if 0 <= py < height:
-                    draw.line((x0, py, x1, py), fill=(255, 0, 0))
+                self._peaks[i]=float(bar) if bar>=self._peaks[i] else max(float(bar),self._peaks[i]-max(0.05,self.peak_decay*0.5))
+                py=height-1-int(round(self._peaks[i]));
+                if 0<=py<height: draw.line((x0,py,x1,py),fill=(255,0,0))
             elif self.show_peaks:
-                self._peaks[i] = float(bar) if bar >= self._peaks[i] else max(0, self._peaks[i] - self.peak_decay)
-                py = height - 1 - int(round(self._peaks[i]))
-                if 0 <= py < height:
-                    draw.line((x0, py, x1, py), fill=self.color_high)
+                self._peaks[i]=float(bar) if bar>=self._peaks[i] else max(0,self._peaks[i]-self.peak_decay); py=height-1-int(round(self._peaks[i]))
+                if 0<=py<height: draw.line((x0,py,x1,py),fill=self.color_high)
 
-    def _render_debug_sensitivity(self, image, draw, width, height):
-        levels = self._debug_sensitivity_levels()
-        usable = max(1, height - 1)
-        slot = width / 16.0
-        for i, level in enumerate(levels):
-            bar = max(0, min(usable, int(round(float(level) * usable))))
-            x0 = int(round(i * slot))
-            x1 = max(x0, int(round((i + 1) * slot)) - 2)
-            for y in range(bar):
-                draw.line((x0, height-1-y, x1, height-1-y), fill=self._color(self.color_low, self.color_high, y / max(1, usable-1)))
+    def _render_debug_sensitivity(self,image,draw,width,height):
+        levels=self._debug_sensitivity_levels(); usable=max(1,height-1); slot=width/16.0
+        for i,level in enumerate(levels):
+            bar=max(0,min(usable,int(round(float(level)*usable)))); x0=int(round(i*slot)); x1=max(x0,int(round((i+1)*slot))-2)
+            for y in range(bar): draw.line((x0,height-1-y,x1,height-1-y),fill=self._color(self.color_low,self.color_high,y/max(1,usable-1)))
 
-    def _render_analog(self, image, draw, width, height):
-        # A real VU meter represents programme level over roughly 300 ms rather
-        # than the instantaneous 11 ms ALSA read chunks. This removes the
-        # artificial beat-by-beat oscillation while retaining natural motion.
-        rms = self._recent_rms(0.300)
-        input_db = 20.0 * math.log10(max(rms, 1e-9))
-        # The microphone was calibrated at sensitivity 8. Sensitivity 4 is now
-        # the UI default, so rebase the control around 4 while preserving the
-        # original measured 0 VU point (-44.5 dBFS at the microphone).
-        gain_db = 20.0 * math.log10(max(0.01, self.sensitivity) / 4.0)
-        target_vu_db = input_db + 44.5 + gain_db
-
-        now = time.monotonic()
-        if self._vu_envelope is None or self._vu_last_update is None:
-            self._vu_envelope = target_vu_db
+    def _render_analog(self,image,draw,width,height):
+        rms=self._recent_rms(0.300); input_db=20.0*math.log10(max(rms,1e-9)); gain_db=20.0*math.log10(max(0.01,self.sensitivity)/4.0)
+        target_vu_db=input_db+44.5+gain_db; now=time.monotonic()
+        if self._vu_envelope is None or self._vu_last_update is None: self._vu_envelope=target_vu_db
         else:
-            dt = max(0.001, min(0.25, now - self._vu_last_update))
-            # Mechanical-style ballistics: a little quicker on rising programme
-            # level, more relaxed on the return. The 300 ms RMS window already
-            # supplies the integration; this models the pointer inertia only.
-            tau = 0.12 if target_vu_db > self._vu_envelope else 0.22
-            alpha = 1.0 - math.exp(-dt / tau)
-            self._vu_envelope += (target_vu_db - self._vu_envelope) * alpha
-        self._vu_last_update = now
-
-        vu_db = max(-20.0, min(3.0, self._vu_envelope))
-        scale = [(-20.0, 0.00), (-10.0, 0.25), (-7.0, 0.39), (-5.0, 0.50), (-3.0, 0.62), (0.0, 0.82), (3.0, 1.00)]
-        level = 0.0
-        for i in range(len(scale) - 1):
-            db0, p0 = scale[i]
-            db1, p1 = scale[i+1]
-            if vu_db <= db1:
-                fraction = (vu_db - db0) / (db1 - db0) if db1 != db0 else 0.0
-                level = p0 + (p1 - p0) * max(0.0, min(1.0, fraction))
-                break
-        else:
-            level = 1.0
-        # The envelope above already has physical ballistics, so avoid another
-        # heavy low-pass stage here. A light pointer interpolation prevents
-        # single-pixel chatter without turning the motion into a metronome.
-        self._needle_level += (level - self._needle_level) * 0.45
-        cx = width // 2
-        cy = height + 10
-        radius = max(18, min(width // 2 - 3, height + 7))
-        start = math.radians(205)
-        end = math.radians(335)
-
-        def point(angle, r):
-            return (int(round(cx + math.cos(angle) * r)), int(round(cy + math.sin(angle) * r)))
-
-        arc_box = (cx-radius, cy-radius, cx+radius, cy+radius)
-        draw.arc(arc_box, start=205, end=335, fill=(100, 100, 60), width=1)
-        labels = [(-20, 0.00), (-10, 0.25), (-7, 0.39), (-5, 0.50), (-3, 0.62), (0, 0.82), (3, 1.00)]
-        for db_value, pos in labels:
-            a = start + (end - start) * pos
-            outer = point(a, radius)
-            inner = point(a, radius - 4)
-            color = (255, 50, 20) if db_value >= 0 else ((255, 190, 20) if db_value >= -5 else (80, 220, 80))
-            draw.line((inner[0], inner[1], outer[0], outer[1]), fill=color)
-            text = str(db_value) if db_value < 0 else ('0' if db_value == 0 else '+3')
-            tx, ty = point(a, radius - 9)
-            draw.text((tx - len(text) * 3, ty - 3), text, fill=color)
-        draw.text((max(0, cx - 6), 0), 'VU', fill=(255, 255, 255))
-        angle = start + (end - start) * self._needle_level
-        tip = point(angle, radius - 2)
-        pivot = (cx, cy)
-        draw.line((pivot[0], pivot[1], tip[0], tip[1]), fill=(255, 40, 20), width=2)
-        draw.ellipse((cx-2, height-3, cx+2, height+1), fill=(220, 180, 80))
+            dt=max(0.001,min(0.25,now-self._vu_last_update)); tau=0.12 if target_vu_db>self._vu_envelope else 0.22
+            self._vu_envelope+=(target_vu_db-self._vu_envelope)*(1.0-math.exp(-dt/tau))
+        self._vu_last_update=now; vu_db=max(-20.0,min(3.0,self._vu_envelope))
+        scale=[(-20.0,0.00),(-10.0,0.25),(-7.0,0.39),(-5.0,0.50),(-3.0,0.62),(0.0,0.82),(3.0,1.00)]; level=0.0
+        for i in range(len(scale)-1):
+            db0,p0=scale[i]; db1,p1=scale[i+1]
+            if vu_db<=db1:
+                fraction=(vu_db-db0)/(db1-db0) if db1!=db0 else 0.0; level=p0+(p1-p0)*max(0.0,min(1.0,fraction)); break
+        else: level=1.0
+        self._needle_level+=(level-self._needle_level)*0.45; cx=width//2; cy=height+10; radius=max(18,min(width//2-3,height+7)); start=math.radians(205); end=math.radians(335)
+        def point(angle,r): return (int(round(cx+math.cos(angle)*r)),int(round(cy+math.sin(angle)*r)))
+        draw.arc((cx-radius,cy-radius,cx+radius,cy+radius),start=205,end=335,fill=(100,100,60),width=1)
+        labels=[(-20,0.00),(-10,0.25),(-7,0.39),(-5,0.50),(-3,0.62),(0,0.82),(3,1.00)]
+        for db_value,pos in labels:
+            a=start+(end-start)*pos; outer=point(a,radius); inner=point(a,radius-4); color=(255,50,20) if db_value>=0 else ((255,190,20) if db_value>=-5 else (80,220,80))
+            draw.line((inner[0],inner[1],outer[0],outer[1]),fill=color); text=str(db_value) if db_value<0 else ('0' if db_value==0 else '+3'); tx,ty=point(a,radius-9); draw.text((tx-len(text)*3,ty-3),text,fill=color)
+        draw.text((max(0,cx-6),0),'VU',fill=(255,255,255)); angle=start+(end-start)*self._needle_level; tip=point(angle,radius-2)
+        draw.line((cx,cy,tip[0],tip[1]),fill=(255,40,20),width=2); draw.ellipse((cx-2,height-3,cx+2,height+1),fill=(220,180,80))
 
     def _render(self):
-        width, height = int(self.display_manager.width), int(self.display_manager.height)
-        image = Image.new('RGB', (width, height), (0, 0, 0))
-        draw = ImageDraw.Draw(image)
+        width,height=int(self.display_manager.width),int(self.display_manager.height); image=Image.new('RGB',(width,height),(0,0,0)); draw=ImageDraw.Draw(image)
         if not self._capture_running():
-            draw.rectangle((0, 0,width-1,height-1), outline=(100,0,0))
-            draw.line((0,0,width-1,height-1), fill=(255,0,0))
-            draw.line((width-1,0,0,height-1), fill=(255,0,0))
-            return image
-        if self.vu_mode == 'analog_needle':
-            self._render_analog(image, draw, width, height)
-        elif self.vu_mode == 'spectrum_falling':
-            self._render_spectrum(image, draw, width, height, falling=True)
-        elif self.vu_mode == 'debug_sensitivity':
-            self._render_debug_sensitivity(image, draw, width, height)
-        else:
-            self._render_spectrum(image, draw, width, height)
+            draw.rectangle((0,0,width-1,height-1),outline=(100,0,0)); draw.line((0,0,width-1,height-1),fill=(255,0,0)); draw.line((width-1,0,0,height-1),fill=(255,0,0)); return image
+        if self.vu_mode=='analog_needle': self._render_analog(image,draw,width,height)
+        elif self.vu_mode=='spectrum_falling': self._render_spectrum(image,draw,width,height,falling=True)
+        elif self.vu_mode=='debug_sensitivity': self._render_debug_sensitivity(image,draw,width,height)
+        else: self._render_spectrum(image,draw,width,height)
         return image
 
-    def display(self, force_clear=False):
+    def display(self,force_clear=False):
         try:
-            self.display_manager.image = self._render()
-            self.display_manager.draw = ImageDraw.Draw(self.display_manager.image)
-            self.display_manager.update_display()
-        except Exception as exc:
-            self.logger.error('Audio visualizer render failed: %s', exc, exc_info=True)
+            self.display_manager.image=self._render(); self.display_manager.draw=ImageDraw.Draw(self.display_manager.image); self.display_manager.update_display()
+        except Exception as exc: self.logger.error('Audio visualizer render failed: %s',exc,exc_info=True)
 
     def validate_config(self):
-        return super().validate_config() and self.min_frequency < self.max_frequency
+        return super().validate_config() and self.min_frequency<self.max_frequency
 
     def get_info(self):
-        info = super().get_info()
-        with self._lock:
-            rms = self._current_rms
-        info.update({'audio_input_running': self._capture_running(), 'audio_error': self._audio_error, 'rms_level': round(rms,5), 'keep_active': self.keep_active, 'vu_mode': self.vu_mode, 'input_device': self.input_device or 'auto', 'sample_rate': self.sample_rate, 'fft_size': self.fft_size})
+        info=super().get_info()
+        with self._lock: rms=self._current_rms
+        info.update({'audio_input_running':self._capture_running(),'audio_error':self._audio_error,'rms_level':round(rms,5),'keep_active':self.keep_active,'vu_mode':self.vu_mode,'input_device':self.input_device or 'auto','microphone_match':self.microphone_match,'selected_microphone':self._selected_device_name,'selected_alsa_device':self._selected_device,'sample_rate':self.sample_rate,'fft_size':self.fft_size})
         return info
